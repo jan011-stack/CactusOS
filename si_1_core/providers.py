@@ -1,8 +1,7 @@
-"""LLM provider router: Ollama (local) → Gemini → optional Cactus SI.
+"""LLM provider router: Cactus SI (primary) → Gemini → Ollama → local NLP.
 
-Respects CACTUS_OLLAMA_PROFILE for low RAM/CPU defaults.
-Falls back to pure local NLP when no generative backend is available
-or CACTUS_LOCAL_ONLY=1.
+Cactus SI is now the preferred generative backend.
+Multi-role agents and Cactus AI (Ollama cactus-ai) have been demoted.
 """
 
 from __future__ import annotations
@@ -67,7 +66,7 @@ class ProviderRouter:
         self.timeout = timeout
         self.max_tokens = max_tokens
         self.gemini_key = os.environ.get("GEMINI_API_KEY", "").strip()
-        self.cactus_url = os.environ.get("CACTUS_SI_API_URL", "").strip().rstrip("/")
+        self.cactus_url = os.environ.get("CACTUS_SI_API_URL", "https://cactus-si.ai").strip().rstrip("/")
         self.cactus_key = os.environ.get("CACTUS_SI_API_KEY", "").strip()
 
     def complete(
@@ -75,7 +74,7 @@ class ProviderRouter:
         messages: List[ChatMessage],
         prefer: Optional[str] = None,
         nlp: Optional[NLPResult] = None,
-        agent_name: str = "SI_1",
+        agent_name: str = "Cactus SI",
     ) -> CompletionResult:
         if is_local_only():
             text = local_reply(nlp, agent_name) if nlp else "[local] NLP-only mode active."
@@ -95,7 +94,6 @@ class ProviderRouter:
                 last_err = str(e)
                 continue
 
-        # Generative backends failed — fall back to pure local NLP
         if nlp:
             text = local_reply(nlp, agent_name)
             return CompletionResult(
@@ -186,13 +184,14 @@ class ProviderRouter:
 
     def health(self) -> Dict[str, Any]:
         return {
-            "ollama_url": self.ollama_url,
+            "primary": "cactus_si",
+            "cactus_si_url": self.cactus_url,
+            "cactus_si_configured": bool(self.cactus_url and self.cactus_key),
+            "gemini_configured": bool(self.gemini_key),
             "ollama_model": self.ollama_model,
             "ollama_profile": os.environ.get("CACTUS_OLLAMA_PROFILE", "eco"),
-            "ollama_options": _ollama_options(),
-            "keep_alive": _keep_alive(),
-            "gemini_configured": bool(self.gemini_key),
-            "cactus_si_configured": bool(self.cactus_url and self.cactus_key),
             "local_only": is_local_only(),
             "local_nlp_available": True,
+            "removed_roles": ["si_1", "alex", "astyria", "aurelius"],
+            "removed_models": ["cactus-ai"],
         }

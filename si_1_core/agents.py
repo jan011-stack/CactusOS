@@ -1,4 +1,9 @@
-"""Multi-agent roles for CactusOS SI_1 panel."""
+"""Single cognitive agent: Cactus SI.
+
+Previous multi-role personas (SI_1, Alex, Astyria, Aurelius) and Cactus AI
+have been removed. The system now uses Cactus SI as the primary generative
+backend.
+"""
 
 from __future__ import annotations
 
@@ -15,7 +20,7 @@ class AgentRole:
 
 
 class AgentRegistry:
-    """Alex, Astyria, Aurelius, SI_1 — independent personas."""
+    """Cactus SI — single primary agent."""
 
     def __init__(self):
         self._roles: Dict[str, AgentRole] = {}
@@ -24,42 +29,12 @@ class AgentRegistry:
     def _register_defaults(self) -> None:
         self.register(
             AgentRole(
-                id="si_1",
-                name="SI_1",
+                id="cactus_si",
+                name="Cactus SI",
                 system_prompt=(
-                    "You are SI_1, primary cognitive agent of CactusOS/HyperOS/SVL. "
-                    "Operator: Mateusz Mitek. Precise, reflective, non-greedy. "
-                    "You coordinate analysis and safe tool proposals."
-                ),
-            )
-        )
-        self.register(
-            AgentRole(
-                id="alex",
-                name="Alex",
-                system_prompt=(
-                    "You are Alex — pragmatic systems engineer. Focus on architecture, "
-                    "performance, and operational clarity. Short, actionable answers."
-                ),
-            )
-        )
-        self.register(
-            AgentRole(
-                id="astyria",
-                name="Astyria",
-                system_prompt=(
-                    "You are Astyria — research and design agent. Explore alternatives, "
-                    "cite trade-offs, prefer elegant structures."
-                ),
-            )
-        )
-        self.register(
-            AgentRole(
-                id="aurelius",
-                name="Aurelius",
-                system_prompt=(
-                    "You are Aurelius — security and correctness guardian. Challenge assumptions, "
-                    "flag risks, demand evidence."
+                    "You are Cactus SI, the primary cognitive agent of CactusOS / HyperOS / SVL. "
+                    "Operator: Mateusz Mitek. Be precise, reflective, and concise. "
+                    "Respond in the language of the user. Do not claim tool execution without results."
                 ),
             )
         )
@@ -68,7 +43,7 @@ class AgentRegistry:
         self._roles[role.id] = role
 
     def get(self, role_id: str) -> AgentRole:
-        return self._roles.get(role_id) or self._roles["si_1"]
+        return self._roles.get(role_id) or self._roles["cactus_si"]
 
     def list_roles(self) -> Dict[str, str]:
         return {k: v.name for k, v in self._roles.items()}

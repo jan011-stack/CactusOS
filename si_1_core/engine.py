@@ -1,8 +1,10 @@
-"""SI_1 Engine — orchestration of NLP + providers + agents + memory."""
+"""SI_1 Engine — now driven by Cactus SI.
+
+Multi-role agents removed. Single agent: Cactus SI.
+"""
 
 from __future__ import annotations
 
-import json
 from dataclasses import dataclass, field
 from datetime import datetime
 from typing import Any, Dict, List, Optional
@@ -21,7 +23,7 @@ class SI1Config:
     gemini_model: str = "gemini-2.0-flash"
     max_tokens: int = 1024
     memory_turns: int = 24
-    default_agent: str = "si_1"
+    default_agent: str = "cactus_si"
 
 
 @dataclass
@@ -53,7 +55,7 @@ class SI1Response:
 
 
 class SI1Engine:
-    """Best-effort cognitive core for CactusOS."""
+    """Cognitive core now centered on Cactus SI."""
 
     def __init__(self, config: Optional[SI1Config] = None):
         self.config = config or SI1Config()
@@ -143,19 +145,16 @@ class SI1Engine:
             error=result.error,
         )
 
-    def mission(self, prompt: str, agents: Optional[List[str]] = None) -> Dict[str, SI1Response]:
-        ids = agents or ["alex", "astyria", "aurelius", "si_1"]
-        return {aid: self.chat(prompt, agent_id=aid, use_memory=True) for aid in ids}
-
     def status(self) -> Dict[str, Any]:
         return {
-            "engine": "SI_1",
-            "version": "1.1.0-QuantumWheel-2026",
+            "engine": "Cactus SI",
+            "version": "1.2.0-CactusSI",
             "operator": "Mateusz Mitek",
             "providers": self.router.health(),
             "agents": self.agents.list_roles(),
             "memory_turns": self.config.memory_turns,
             "timestamp": datetime.now().isoformat(timespec="seconds"),
+            "note": "Multi-role agents and Cactus AI removed; Cactus SI is primary.",
         }
 
     def approve_tool(self, proposal: ToolProposal) -> Dict[str, Any]:
