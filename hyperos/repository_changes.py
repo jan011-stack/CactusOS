@@ -199,6 +199,23 @@ class RepositoryChangeBroker:
             "changes": [{"path": item["path"], "diff": item["diff"]} for item in proposed_files],
         }
 
+    def list_pending(self):
+        now = self.clock()
+        with self.lock:
+            self.pending = {
+                proposal_id: proposal
+                for proposal_id, proposal in self.pending.items()
+                if proposal[1] > now
+            }
+            return [{
+                "proposal_id": proposal_id,
+                "expires_in": max(0, int(expires_at - now)),
+                "changes": [
+                    {"path": item["path"], "diff": item["diff"]}
+                    for item in files
+                ],
+            } for proposal_id, (files, expires_at) in self.pending.items()]
+
     def resolve(self, proposal_id, approved):
         if not isinstance(proposal_id, str) or type(approved) is not bool:
             raise ValueError("Nieprawidłowe zatwierdzenie propozycji")

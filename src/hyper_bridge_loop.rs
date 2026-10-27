@@ -1,6 +1,5 @@
-//! Non-blocking terminal/agent/Ollama integration driver.
+//! Non-blocking terminal/Ollama integration driver.
 
-use crate::hyper_agent_bridge::{AgentProducer, BridgeError};
 use crate::hyper_ollama_client::{
     HyperOllamaClient, IoError, NonBlockingSocket, RequestEncoder, RequestError, SendProgress,
 };
@@ -141,7 +140,6 @@ impl ChunkDecoder {
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum BridgeErrorLoop {
     InvalidTerminalInput,
-    AgentQueueFull,
     Request(RequestError),
     Io(IoError),
     InvalidHttpResponse,
@@ -169,9 +167,6 @@ pub trait NonBlockingOutput {
 /// One HTTP request at a time; call `poll` from the system's regular event loop.
 pub struct HyperBridgeLoop<'a> {
     request: Option<RequestEncoder<'a>>,
-    agent_metadata: [u8; 32],
-    metadata_len: usize,
-    metadata_offset: usize,
     headers: [u8; HTTP_HEADER_BYTES],
     headers_len: usize,
     http_body_started: bool,
@@ -189,9 +184,6 @@ impl<'a> HyperBridgeLoop<'a> {
     pub const fn new() -> Self {
         Self {
             request: None,
-            agent_metadata: [0; 32],
-            metadata_len: 0,
-            metadata_offset: 0,
             headers: [0; HTTP_HEADER_BYTES],
             headers_len: 0,
             http_body_started: false,
@@ -206,11 +198,10 @@ impl<'a> HyperBridgeLoop<'a> {
         }
     }
 
-    /// Validate through HyperSpaceTerminal, enqueue agent metadata, then prepare Ollama POST.
+    /// Validate through HyperSpaceTerminal, then prepare Ollama POST.
     pub fn begin(
         &mut self,
         terminal: &HyperSpaceTerminal,
-        agent: &mut AgentProducer<'_>,
         prompt: &'a [u8],
         image: &'a [u8],
     ) -> Result<(), BridgeErrorLoop> {
@@ -221,19 +212,6 @@ impl<'a> HyperBridgeLoop<'a> {
         }
 
         let request = HyperOllamaClient::send_vision_request(prompt, image)?;
-        agent
-            .publish_terminal_text(prompt)
-            .map_err(|error| match error {
-                BridgeError::QueueFull | BridgeError::PayloadTooLarge => BridgeErrorLoop::AgentQueueFull,
-            })?;
-
-        self.agent_metadata = [0; 32];
-        let prefix = agent.identity().prefix().as_bytes();
-        self.agent_metadata[..prefix.len()].copy_from_slice(prefix);
-        const SUFFIX: &[u8] = b" -> Ollama\n";
-        self.agent_metadata[prefix.len()..prefix.len() + SUFFIX.len()].copy_from_slice(SUFFIX);
-        self.metadata_len = prefix.len() + SUFFIX.len();
-        self.metadata_offset = 0;
         self.request = Some(request);
         self.headers_len = 0;
         self.http_body_started = false;
@@ -259,21 +237,6 @@ impl<'a> HyperBridgeLoop<'a> {
     {
         if self.complete {
             return Ok(LoopProgress::Complete);
-        }
-
-        if self.metadata_offset < self.metadata_len {
-            let written = match output
-                .try_write(&self.agent_metadata[self.metadata_offset..self.metadata_len])
-            {
-                Ok(written) => written,
-                Err(IoError::WouldBlock) => return Ok(LoopProgress::Pending),
-                Err(error) => return Err(BridgeErrorLoop::Io(error)),
-            };
-            if written == 0 {
-                return Err(BridgeErrorLoop::OutputFailure);
-            }
-            self.metadata_offset += written.min(self.metadata_len - self.metadata_offset);
-            return Ok(LoopProgress::Pending);
         }
 
         if let Some(request) = self.request.as_mut() {
@@ -403,7 +366,6 @@ mod tests {
         header_is_chunked, valid_http_status, ChunkDecoder, HyperBridgeLoop, LoopProgress,
         NonBlockingOutput,
     };
-    use crate::hyper_agent_bridge::HyperAgentBridge;
     use crate::hyper_ollama_client::{IoError, NonBlockingSocket};
     use crate::sanitized_stream_reader::SanitizedStreamReader;
     use crate::terminal::HyperSpaceTerminal;
@@ -477,12 +439,10 @@ mod tests {
 
     #[test]
     fn integration_loop_routes_and_streams_chunked_ollama_response() {
-        let mut agent_bridge = HyperAgentBridge::new();
-        let (mut producers, _) = agent_bridge.split();
         let mut bridge_loop = HyperBridgeLoop::new();
         let terminal = HyperSpaceTerminal::new();
         bridge_loop
-            .begin(&terminal, &mut producers[0], b"describe", &[1, 2, 3])
+            .begin(&terminal, b"describe", &[1, 2, 3])
             .unwrap();
 
         let mut socket = MockSocket {
@@ -505,7 +465,6 @@ mod tests {
         }
         assert!(completed);
         assert!(socket.request.starts_with(b"POST /api/generate HTTP/1.1\r\n"));
-        assert!(output.0.starts_with(b"Alex -> Ollama\n"));
         assert!(output.0.ends_with(b"x"));
     }
 }

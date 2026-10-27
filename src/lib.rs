@@ -4,8 +4,6 @@
 extern crate std;
 
 pub mod hyper_math;
-pub mod cognitive_bridge;
-pub use cognitive_bridge as si_bridge;
 pub mod hyper_model;
 pub mod hyper_vision;
 pub mod hyper_allocator;
@@ -15,9 +13,6 @@ pub mod chrono_log;
 pub mod hyperspace_io;
 pub mod kernel;
 pub mod terminal;
-pub mod hyper_agent_bridge;
-pub mod hyper_agent_compartment;
-pub mod hyper_chat_stream;
 pub mod sanitized_stream_reader;
 pub mod hyper_ollama_client;
 pub mod hyper_bridge_loop;

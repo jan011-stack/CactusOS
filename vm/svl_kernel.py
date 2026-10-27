@@ -81,7 +81,7 @@ class SVLSystemKernel:
             {
                 "wersja": "1.0.0-Legacy",
                 "typ": "Kognitywna SI",
-                "opis": "Inicjalizacja bazowa. Osadzenie pierwotnych matryc behawioralnych agentów.",
+                "opis": "Inicjalizacja bazowa. Osadzenie pierwotnych matryc behawioralnych.",
                 "data": "700tys_lat_wstecz",
             },
             {

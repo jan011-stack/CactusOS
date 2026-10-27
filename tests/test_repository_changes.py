@@ -46,6 +46,23 @@ class RepositoryChangeBrokerTests(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "wykorzystana"):
             self.broker.resolve(proposal["proposal_id"], True)
 
+    def test_pending_queue_lists_diffs_and_drops_expired_proposals(self):
+        now = [100.0]
+        broker = RepositoryChangeBroker(self.root, clock=lambda: now[0])
+        proposal = broker.propose_changes(broker.read_files(["src/main.py"]), [{
+            "path": "src/new.py", "action": "create", "content": "print('new')\n",
+        }])
+
+        pending = broker.list_pending()
+        self.assertEqual(len(pending), 1)
+        self.assertEqual(pending[0]["proposal_id"], proposal["proposal_id"])
+        self.assertEqual(pending[0]["changes"], proposal["changes"])
+        self.assertGreater(pending[0]["expires_in"], 0)
+
+        now[0] += 601
+        self.assertEqual(broker.list_pending(), [])
+        self.assertEqual(broker.pending, {})
+
     def test_rejection_and_stale_file_never_write_proposed_content(self):
         original = self.broker.read_files(["src/main.py"])
         proposal = self.broker.propose_changes(original, [{

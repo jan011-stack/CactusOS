@@ -1,10 +1,10 @@
 const rootTerminalState = {
   busy: false, proposal: null, vector: '', reply: '', result: '', error: '',
-  executionAllowed: false,
+  executionAllowed: false, consent: false,
 };
 
 const userTerminalState = {
-  busy: false, proposal: null, result: '', error: '', executionAllowed: false,
+  busy: false, proposal: null, result: '', error: '', executionAllowed: false, consent: false,
 };
 
 function rootTerminalPage() {
@@ -14,6 +14,17 @@ function rootTerminalPage() {
       <input id="root-command-input" class="terminal-input" maxlength="2000" required autocomplete="off" placeholder="Polecenie lub opis zmiany w swobodnym języku" aria-label="Polecenie hiperterminala">
       <button class="button primary" type="submit">${icon('send')} Wyślij do modelu</button>
     </form>
+    <section id="root-approval" class="approval-inline" aria-live="polite" hidden>
+      <strong>Wymagana zgoda · uprawnienia root</strong>
+      <p>Sprawdź dokładne polecenie przed uruchomieniem jako root:</p>
+      <pre id="root-approval-command" class="root-text"></pre>
+      <p id="root-approval-error" class="root-error" role="status"></p>
+      <label class="root-consent"><input type="checkbox" id="root-approval-consent"> Zatwierdzam dokładnie to polecenie.</label>
+      <div class="heading-actions">
+        <button id="root-approval-approve" class="button primary" type="button" disabled>Wykonaj jako root</button>
+        <button id="root-approval-reject" class="button" type="button">Odrzuć</button>
+      </div>
+    </section>
     <p id="root-progress" role="status" class="runtime-detail"></p>
     <p id="root-error" role="alert" class="root-error"></p>
     <div class="content-grid">
@@ -31,8 +42,8 @@ async function rootRequest(path, data) {
 }
 
 function updateUserTerminal() {
-  syncApprovalDialog();
   const state = userTerminalState;
+  updateApprovalNotice();
   const error = document.querySelector('#user-command-error');
   const result = document.querySelector('#user-command-result');
   if (error) error.textContent = state.error;
@@ -48,6 +59,14 @@ function bindUserTerminal() {
   const form = document.querySelector('#command-form');
   if (!form) return;
   userTerminalState.executionAllowed = Boolean(document.querySelector('meta[name="terminal-csrf"]'));
+  pageContent.querySelector('#user-approval-consent')?.addEventListener('change', event => {
+    userTerminalState.consent = event.target.checked;
+    updateUserTerminal();
+  });
+  pageContent.querySelector('#user-approval-approve')
+    ?.addEventListener('click', () => resolveUserProposal(true));
+  pageContent.querySelector('#user-approval-reject')
+    ?.addEventListener('click', () => resolveUserProposal(false));
   updateUserTerminal();
 }
 
@@ -60,6 +79,7 @@ async function submitUserCommand(prompt, entry) {
   try {
     const proposal = await rootRequest('/api/terminal/propose', { prompt });
     entry.text = proposal.reply;
+    state.consent = false;
     state.proposal = proposal.proposal_id ? proposal : null;
   } catch (error) {
     entry.kind = 'notice';
@@ -74,7 +94,7 @@ async function submitUserCommand(prompt, entry) {
 async function resolveUserProposal(approved) {
   const state = userTerminalState;
   if (state.busy || !state.proposal) return;
-  if (approved && (!state.executionAllowed || !approvalConsent.checked)) return;
+  if (approved && (!state.executionAllowed || !state.consent)) return;
   const proposal = state.proposal;
   state.busy = true;
   state.error = '';
@@ -84,6 +104,7 @@ async function resolveUserProposal(approved) {
       proposal_id: proposal.proposal_id, command: proposal.command, approved,
     });
     state.proposal = null;
+    state.consent = false;
     state.result = result.cancelled ? 'Odrzucono. Niczego nie wykonano.'
       : `${result.output}\nKod wyjścia: ${result.exit_code}${result.truncated ? '\nWyjście ucięte do 64 KiB.' : ''}`;
     events.unshift({time: new Date().toLocaleTimeString('pl-PL'), type: 'CLI',
@@ -100,7 +121,7 @@ async function resolveUserProposal(approved) {
 }
 
 function updateRootTerminal() {
-  syncApprovalDialog();
+  updateApprovalNotice();
   const form = document.querySelector('#root-command-form');
   if (!form) return;
   const state = rootTerminalState;
@@ -119,17 +140,34 @@ function updateRootTerminal() {
 function bindRootTerminal() {
   const form = document.querySelector('#root-command-form');
   if (!form) return;
+  pageContent.querySelector('#root-approval-consent')?.addEventListener('change', event => {
+    rootTerminalState.consent = event.target.checked;
+    updateRootTerminal();
+  });
+  pageContent.querySelector('#root-approval-approve')
+    ?.addEventListener('click', () => resolveRootProposal(true));
+  pageContent.querySelector('#root-approval-reject')
+    ?.addEventListener('click', () => resolveRootProposal(false));
   updateRootTerminal();
   const status = document.querySelector('#root-status');
   if (!document.querySelector('meta[name="terminal-csrf"]')) {
     status.textContent = 'Backend root niepodłączony · port 4180';
   } else {
-    fetch('/api/root/status').then(response => response.json()).then(result => {
+    fetch('/api/root/status', { cache: 'no-store' }).then(async response => {
+      const result = await response.json();
+      if (!response.ok) throw new Error(`${result.error || 'Błąd serwera'} (HTTP ${response.status})`);
+      return result;
+    }).then(result => {
       rootTerminalState.executionAllowed = result.execution_allowed === true && result.root_available === true;
       status.textContent = rootTerminalState.executionAllowed ? 'ROOT DOSTĘPNY · WYMAGA ZGODY'
-        : 'ROZMOWA DOSTĘPNA · WYKONANIE ROOT TYLKO LOKALNIE';
+        : 'ROOT NIEDOSTĘPNY · SPRAWDŹ UPRAWNIENIA SERWERA';
       updateRootTerminal();
-    }).catch(() => { status.textContent = 'Backend niedostępny'; });
+    }).catch(error => {
+      rootTerminalState.executionAllowed = false;
+      rootTerminalState.error = `Nie można sprawdzić uprawnień root: ${error.message}`;
+      status.textContent = 'Backend niedostępny';
+      updateRootTerminal();
+    });
   }
 
   form.addEventListener('submit', async event => {
@@ -148,6 +186,7 @@ function bindRootTerminal() {
       const proposal = await rootRequest('/api/root/propose', { prompt });
       state.vector = proposal.vector;
       state.reply = proposal.reply;
+      state.consent = false;
       state.proposal = proposal.proposal_id ? proposal : null;
     } catch (error) {
       state.error = error.message;
@@ -158,10 +197,32 @@ function bindRootTerminal() {
   });
 }
 
+function updateApprovalNotice() {
+  for (const [prefix, state, scope] of [
+    ['user', userTerminalState, 'Wykonaj'],
+    ['root', rootTerminalState, 'Wykonaj jako root'],
+  ]) {
+    const approval = document.querySelector(`#${prefix}-approval`);
+    if (!approval) continue;
+    approval.hidden = !state.proposal;
+    if (!state.proposal) continue;
+    document.querySelector(`#${prefix}-approval-command`).textContent = state.proposal.command;
+    document.querySelector(`#${prefix}-approval-error`).textContent = state.error
+      || (state.busy ? 'Przetwarzanie decyzji…' : '');
+    const consent = document.querySelector(`#${prefix}-approval-consent`);
+    consent.checked = state.consent;
+    consent.disabled = state.busy;
+    const approve = document.querySelector(`#${prefix}-approval-approve`);
+    approve.textContent = state.busy ? 'Przetwarzanie…' : scope;
+    approve.disabled = state.busy || !state.executionAllowed || !state.consent;
+    document.querySelector(`#${prefix}-approval-reject`).disabled = state.busy;
+  }
+}
+
 async function resolveRootProposal(approved) {
   const state = rootTerminalState;
   if (state.busy || !state.proposal) return;
-  if (approved && (!state.executionAllowed || !approvalConsent.checked)) return;
+  if (approved && (!state.executionAllowed || !state.consent)) return;
   const proposal = state.proposal;
   state.busy = true;
   state.error = '';
@@ -171,6 +232,7 @@ async function resolveRootProposal(approved) {
       proposal_id: proposal.proposal_id, command: proposal.command, approved,
     });
     state.proposal = null;
+    state.consent = false;
     state.result = result.cancelled ? 'Odrzucono. Niczego nie wykonano.'
       : `${result.output}\nKod wyjścia: ${result.exit_code}${result.truncated ? '\nWyjście ucięte do 64 KiB.' : ''}`;
     events.unshift({time: new Date().toLocaleTimeString('pl-PL'), type: 'ROOT',

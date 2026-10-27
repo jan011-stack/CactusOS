@@ -14,11 +14,11 @@ from urllib.error import HTTPError
 from hyperos.web_server import (
     GEMINI_MODEL,
     TerminalBroker,
-    _asks_agent_model_layout,
     _bounded_ping_command,
     _requests_execution,
     CACTUS_SI_MODEL,
     cactus_si_generate,
+    execute_root,
     execute_user_command,
     gemini_generate,
     validate_chat_messages,
@@ -27,6 +27,7 @@ from hyperos.web_server import (
     propose_with_primary_model,
     propose_with_ollama,
     repo_change_response,
+    root_available,
 )
 from hyperos.repository_changes import RepositoryChangeBroker
 
@@ -80,6 +81,18 @@ class TerminalBrokerTests(unittest.TestCase):
             with self.assertRaises(PermissionError):
                 execute_user_command("id -u")
 
+    def test_root_process_can_accept_root_execution_without_sudo(self):
+        with patch("hyperos.web_server.os.geteuid", return_value=0), patch(
+                "hyperos.web_server.subprocess.run") as run:
+            self.assertTrue(root_available())
+            run.assert_not_called()
+
+            with patch("hyperos.web_server.subprocess.Popen",
+                       side_effect=RuntimeError("captured")) as popen:
+                with self.assertRaisesRegex(RuntimeError, "captured"):
+                    execute_root("id -u")
+            self.assertEqual(popen.call_args.args[0][0], "/usr/bin/timeout")
+
     def test_cancel_tamper_and_expiry_never_execute(self):
         proposal = self.broker.propose("wykonaj id -u")
         self.broker.resolve(proposal["proposal_id"], False, "id -u")
@@ -123,15 +136,6 @@ class TerminalBrokerTests(unittest.TestCase):
             "How to build this project?",
         ):
             self.assertFalse(_requests_execution(prompt), prompt)
-
-    def test_agent_model_fact_is_deterministic_without_calling_model(self):
-        calls = []
-        broker = TerminalBroker(model=lambda prompt: calls.append(prompt) or {"reply": "BŁĘDNA ODPOWIEDŹ", "command": "answer"})
-        result = broker.propose("Czy agenci mają osobne modele AI?")
-        self.assertTrue(_asks_agent_model_layout("czy Alex ma własny model AI?"))
-        self.assertIn("wspólnej instancji modelu cactus-ai", result["reply"])
-        self.assertIsNone(result["command"])
-        self.assertEqual(calls, [])
 
     def test_ping_command_is_bounded_and_target_is_validated(self):
         command = _bounded_ping_command("Kazałem wysłać ping 127.0.0.1")
@@ -236,7 +240,7 @@ class TerminalBrokerTests(unittest.TestCase):
         }]})
         with patch("hyperos.web_server.gemini_api_key", return_value="key"), patch(
                 "hyperos.web_server.gemini_generate", return_value=response_body) as generate:
-            changes = repo_change_response("alex", "Zmień kod", {"src/main.py": "before\n"})
+            changes = repo_change_response("Zmień kod", {"src/main.py": "before\n"})
         self.assertEqual(changes[0]["path"], "src/main.py")
         self.assertTrue(generate.call_args.kwargs["json_response"])
         self.assertEqual(generate.call_args.kwargs["max_output_tokens"], 8192)
@@ -247,7 +251,7 @@ class TerminalBrokerTests(unittest.TestCase):
         with patch("hyperos.web_server.gemini_api_key", return_value=""), patch(
                 "hyperos.web_server.gemini_generate") as generate:
             with self.assertRaisesRegex(RuntimeError, "GEMINI_API_KEY"):
-                repo_change_response("alex", "Zmień kod", {"src/main.py": "before\n"})
+                repo_change_response("Zmień kod", {"src/main.py": "before\n"})
             generate.assert_not_called()
 
     def test_chat_image_validation_enforces_format_and_limits(self):
@@ -395,7 +399,7 @@ class TerminalBrokerTests(unittest.TestCase):
                     "hyperos.web_server.urlopen", return_value=io.BytesIO(
                     b'{"message":{"content":"Czesc"},"done":true}\n')):
                 connection.request("POST", "/api/ollama/chat", json.dumps({
-                    "messages": [{"role": "user", "content": "czesc Alex"}],
+                    "messages": [{"role": "user", "content": "czesc"}],
                 }), headers)
                 response = connection.getresponse()
                 self.assertEqual(response.status, 200)
@@ -449,40 +453,6 @@ class TerminalBrokerTests(unittest.TestCase):
                 self.assertIn(b"Ollama fallback", response.read())
                 forwarded = json.loads(upstream.call_args.args[0].data)
                 self.assertEqual(forwarded["messages"][1]["images"], [])
-        finally:
-            connection.close()
-            server.shutdown()
-            server.server_close()
-            worker.join()
-
-    def test_web_chat_agent_model_question_uses_local_matcher(self):
-        server = ThreadingHTTPServer(("127.0.0.1", 0), http.client.HTTPConnection)
-        port = server.server_port
-        server.RequestHandlerClass = make_handler(self.broker, "test-csrf", port)
-        worker = threading.Thread(target=server.serve_forever, daemon=True)
-        worker.start()
-        connection = http.client.HTTPConnection("127.0.0.1", port, timeout=5)
-        headers = {"Host": f"localhost:{port}", "Origin": f"http://localhost:{port}",
-                   "Content-Type": "application/json", "X-Terminal-CSRF": "test-csrf"}
-        payload = json.dumps({"messages": [
-            {"role": "user", "content": "Czy agenci korzystają ze wspólnego modelu AI?"},
-        ]})
-        try:
-            with patch("hyperos.web_server.gemini_api_key", return_value="key"), patch(
-                    "hyperos.web_server.gemini_generate") as gemini, patch(
-                    "hyperos.web_server.cactus_si_config", return_value=None), patch(
-                    "hyperos.web_server.urlopen") as upstream:
-                connection.request("POST", "/api/ollama/chat", payload, headers)
-                response = connection.getresponse()
-                body = response.read().decode()
-                self.assertEqual(response.status, 200)
-                self.assertEqual(response.getheader("X-Cactus-Provider"), "Local matcher · Abarkus")
-                self.assertIn(
-                    "wspólnej instancji modelu cactus-ai",
-                    json.loads(body)["message"]["content"],
-                )
-                gemini.assert_not_called()
-                upstream.assert_not_called()
         finally:
             connection.close()
             server.shutdown()
@@ -592,7 +562,6 @@ class TerminalBrokerTests(unittest.TestCase):
                 self.assertEqual(json.loads(response.read())["files"], ["src/main.py"])
 
                 payload = json.dumps({
-                    "agent": "alex",
                     "mission": "Zmień wartość",
                     "paths": ["src/main.py"],
                 })
@@ -606,9 +575,17 @@ class TerminalBrokerTests(unittest.TestCase):
                     self.assertEqual(response.status, 200)
                     proposal = json.loads(response.read())
                     generate.assert_called_once()
-                    self.assertEqual(generate.call_args.args[2], {"src/main.py": "value = 1\n"})
+                    self.assertEqual(generate.call_args.args[1], {"src/main.py": "value = 1\n"})
                 self.assertIn("+value = 2", proposal["changes"][0]["diff"])
                 self.assertEqual((root / "src/main.py").read_text(), "value = 1\n")
+
+                connection.request("GET", "/api/repo/pending", headers={"Host": headers["Host"]})
+                pending_response = connection.getresponse()
+                self.assertEqual(pending_response.status, 200)
+                pending = json.loads(pending_response.read())["proposals"]
+                self.assertEqual(len(pending), 1)
+                self.assertEqual(pending[0]["proposal_id"], proposal["proposal_id"])
+                self.assertEqual(pending[0]["changes"], proposal["changes"])
 
                 connection.request("POST", "/api/repo/resolve", json.dumps({
                     "proposal_id": proposal["proposal_id"], "approved": True,
@@ -617,6 +594,9 @@ class TerminalBrokerTests(unittest.TestCase):
                 self.assertEqual(response.status, 200)
                 self.assertEqual(json.loads(response.read())["applied"], ["src/main.py"])
                 self.assertEqual((root / "src/main.py").read_text(), "value = 2\n")
+                connection.request("GET", "/api/repo/pending", headers={"Host": headers["Host"]})
+                pending_response = connection.getresponse()
+                self.assertEqual(json.loads(pending_response.read())["proposals"], [])
 
                 connection.request("POST", "/api/repo/propose", payload,
                                    headers | {"X-Terminal-CSRF": "wrong"})
@@ -629,7 +609,7 @@ class TerminalBrokerTests(unittest.TestCase):
                 server.server_close()
                 worker.join()
 
-    def test_forwarded_chat_proxy_and_root_separation(self):
+    def test_forwarded_chat_and_explicit_root_approval(self):
         server = ThreadingHTTPServer(("127.0.0.1", 0), http.client.HTTPConnection)
         port = server.server_port
         origin = "https://test-space-4180.app.github.dev"
@@ -655,12 +635,27 @@ class TerminalBrokerTests(unittest.TestCase):
             self.assertEqual(response.status, 200)
             proposal = json.loads(response.read())
             self.assertEqual(self.executed, [])
+            for changes in ({"Origin": "https://other.example"},
+                            {"Host": "other.example"},
+                            {"X-Terminal-CSRF": "wrong"}):
+                connection.request("POST", "/api/root/resolve", json.dumps({
+                    "proposal_id": proposal["proposal_id"], "approved": True, "command": "id -u",
+                }), headers | changes)
+                response = connection.getresponse()
+                self.assertEqual(response.status, 403)
+                response.read()
+                self.assertEqual(self.executed, [])
             connection.request("POST", "/api/root/resolve", json.dumps({
                 "proposal_id": proposal["proposal_id"], "approved": True, "command": "id -u",
             }), headers)
             response = connection.getresponse()
-            self.assertEqual(response.status, 403)
-            self.assertEqual(json.loads(response.read())["code"], "local_only")
+            self.assertEqual(response.status, 200)
+            response.read()
+            self.assertEqual(self.executed, ["id -u"])
+            connection.request("POST", "/api/root/propose", '{"prompt":"wykonaj id -u"}', headers)
+            response = connection.getresponse()
+            self.assertEqual(response.status, 200)
+            proposal = json.loads(response.read())
             connection.request("POST", "/api/root/resolve", json.dumps({
                 "proposal_id": proposal["proposal_id"], "approved": False, "command": "id -u",
             }), headers)
@@ -670,13 +665,13 @@ class TerminalBrokerTests(unittest.TestCase):
             connection.request("GET", "/api/root/status", headers={"Host": headers["Host"]})
             with_status = connection.getresponse()
             self.assertEqual(with_status.status, 200)
-            self.assertFalse(json.loads(with_status.read())["execution_allowed"])
+            self.assertTrue(json.loads(with_status.read())["execution_allowed"])
             with patch("hyperos.web_server.urlopen", side_effect=URLError("offline")):
                 connection.request("GET", "/api/ollama/version", headers={"Host": headers["Host"]})
                 response = connection.getresponse()
                 self.assertEqual(response.status, 503)
                 response.read()
-            self.assertEqual(self.executed, [])
+            self.assertEqual(self.executed, ["id -u"])
         finally:
             connection.close()
             server.shutdown()

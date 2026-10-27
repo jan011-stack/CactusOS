@@ -27,7 +27,7 @@
         <div class="sidebar-label">OBSZAR ROBOCZY</div>
         <nav class="nav-list">
           <button class="nav-item active" data-page="dashboard"><span class="nav-icon" data-icon="grid"></span><span>Pulpit</span><kbd>01</kbd></button>
-          <button class="nav-item" data-page="agents"><span class="nav-icon" data-icon="users"></span><span>Agenci</span><kbd>02</kbd></button>
+          <button class="nav-item" data-page="repo"><span class="nav-icon" data-icon="file"></span><span>Repozytorium</span><kbd>02</kbd></button>
           <button class="nav-item" data-page="terminal"><span class="nav-icon" data-icon="terminal"></span><span>Terminal</span><kbd>03</kbd></button>
           <button class="nav-item" data-page="hyperspace"><span class="nav-icon" data-icon="shield"></span><span>Hiperterminal</span><kbd>ROOT</kbd></button>
           <button class="nav-item" data-page="chronolog"><span class="nav-icon" data-icon="activity"></span><span>ChronoLog</span><kbd>04</kbd></button>
@@ -61,22 +61,5 @@
         <footer class="main-footer"><span>CACTUS CORE <b>·</b> PI GRID 4.0</span><span>TERMINAL: GEMINI / OLLAMA <b>·</b> JĄDRO NIEPODŁĄCZONE</span></footer>
       </div>
     </div>
-    <dialog id="approval-dialog" class="approval-dialog" aria-labelledby="approval-title" aria-describedby="approval-command">
-      <div class="approval-dialog-head">
-        <div>
-          <div class="eyebrow">WYMAGA TWOJEJ DECYZJI</div>
-          <h2 id="approval-title">Zatwierdzenie polecenia</h2>
-        </div>
-        <span class="runtime-tag" id="approval-scope"></span>
-      </div>
-      <p class="approval-dialog-copy">Sprawdź dokładne polecenie przed uruchomieniem.</p>
-      <pre id="approval-command" class="root-text"></pre>
-      <p id="approval-error" class="root-error" role="alert"></p>
-      <label class="root-consent"><input type="checkbox" id="approval-consent"> Zatwierdzam dokładnie to polecenie.</label>
-      <div class="heading-actions">
-        <button id="approval-approve" class="button primary" type="button" disabled>Wykonaj</button>
-        <button id="approval-reject" class="button" type="button">Odrzuć</button>
-      </div>
-    </dialog>
   </body>
 </html>

@@ -14,10 +14,10 @@ class ModelProfileTests(unittest.TestCase):
         self.assertEqual(DEFAULT_MODEL, "cactus-ai")
         self.assertEqual(MODEL_OPTIONS, model_options())
         self.assertEqual(MODEL_OPTIONS["num_ctx"], 2048)
-        self.assertEqual(MODEL_OPTIONS["num_batch"], 2)
-        self.assertEqual(MODEL_OPTIONS["num_thread"], 1)
+        self.assertEqual(MODEL_OPTIONS["num_batch"], 64)
+        self.assertEqual(MODEL_OPTIONS["num_thread"], 4)
         self.assertEqual(MODEL_OPTIONS["num_predict"], 1024)
-        self.assertEqual(active_profile()["keep_alive"], 0)
+        self.assertEqual(active_profile()["keep_alive"], "5m")
 
     def test_system_context_states_limits(self):
         self.assertIn("Brak potwierdzonego połączenia telemetrycznego", CACTUS_SYSTEM_CONTEXT)

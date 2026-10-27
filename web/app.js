@@ -20,13 +20,6 @@ const iconPaths = {
 
 const icon = (name, size = 16) => `<svg width="${size}" height="${size}" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">${iconPaths[name] || iconPaths.grid}</svg>`;
 
-const agents = [
-  { name: 'Alex', initials: 'AX', role: 'Dowódca infrastruktury', status: 'Gotowy', ready: true },
-  { name: 'Astyria', initials: 'AS', role: 'Diagnostyka i naprawa', status: 'Gotowa', ready: true },
-  { name: 'Aurelius', initials: 'AU', role: 'Historia i integralność', status: 'Gotowy', ready: true },
-  { name: 'SI_1', initials: 'SI', role: 'Kanał systemowy', status: 'Oczekuje', ready: false },
-];
-
 const initialEvents = [
   { time: '18:42:07', type: 'CORE', message: 'POST · walidacja siatki PI=4 zakończona', code: '0x00' },
   { time: '18:41:53', type: 'MEM', message: 'HyperAllocator · pule statyczne gotowe', code: '64 × 8 MB' },
@@ -36,8 +29,8 @@ const initialEvents = [
 
 const pageTitles = {
   hyperspace: ['HIPERTERMINAL', 'Terminal binarnej hiperprzestrzeni', 'Kontener Codespaces'],
-  dashboard: ['PULPIT', 'Pulpit systemu', 'Stan rdzenia, agentów i lokalnych usług w jednym miejscu.'],
-  agents: ['AGENTY', 'Kanały agentów', 'Stan izolowanych kanałów komunikacyjnych HyperAgentBridge.'],
+  dashboard: ['PULPIT', 'Pulpit systemu', 'Stan rdzenia i lokalnych usług w jednym miejscu.'],
+  repo: ['REPOZYTORIUM', 'Zmiany w repozytorium', 'Propozycje zmian zapisywane wyłącznie po Twojej zgodzie.'],
   terminal: ['TERMINAL', 'Konsola HyperOS', 'Podgląd poleceń i status kolejki terminala.'],
   chronolog: ['CHRONOLOG', 'Strumień zdarzeń', 'Ostatnie wpisy rejestru systemowego.'],
   models: ['MODELE', 'Magazyn modeli', 'Lokalne wagi multimodalne i status runtime’u.'],
@@ -47,25 +40,22 @@ const pageTitles = {
 const pageContent = document.querySelector('#page-content');
 const navButtons = [...document.querySelectorAll('.nav-item')];
 const breadcrumb = document.querySelector('#breadcrumb-current');
-const approvalDialog = document.querySelector('#approval-dialog');
-const approvalConsent = document.querySelector('#approval-consent');
 let currentPage = 'dashboard';
 let events = [...initialEvents];
 let commandHistory = [
-  { text: 'Pisz swobodnie: odpowiada skonfigurowany model (Cactus SI, Gemini lub Ollama). @alex, @astyria, @aurelius, @si_1 wybierają rolę, clear czyści terminal.', kind: 'notice' },
+  { text: 'Pisz swobodnie: odpowiada skonfigurowany model (Cactus SI, Gemini lub Ollama). clear czyści terminal.', kind: 'notice' },
 ];
-let chatHistories = {};
-let selectedChatAgent = 'alex';
-let missionState = null;
-let missionBusy = false;
+let chatMessages = [];
 let repoFiles = [];
 let repoFilesLoaded = false;
 let repoFilesAttempted = false;
 let repoFilesLoading = false;
 let repoFilesError = '';
 let repoSelectedFiles = [];
-let repoSelectedAgent = 'alex';
-let repoChanges = null;
+let repoQueue = [];
+let repoQueueLoading = false;
+let repoQueueError = '';
+let repoQueueTimer = null;
 let repoChangeError = '';
 let repoBusy = false;
 let pendingMediaFiles = [];
@@ -79,14 +69,9 @@ let pendingTerminalEntry = null;
 const MAX_MEDIA_FILE_BYTES = 20 * 1024 * 1024;
 const MAX_MEDIA_IMAGE_BYTES = 1024 * 1024;
 const MAX_MEDIA_TOTAL_BYTES = 3 * 1024 * 1024;
-const MAX_AGENT_HISTORY_MESSAGES = 12;
 
 function metricCard(label, value, unit, note, iconName, color) {
   return `<article class="metric" style="--metric-color:${color}"><div class="metric-head"><span>${label}</span><span class="mini-icon">${icon(iconName, 14)}</span></div><div class="metric-value">${value}<small>${unit}</small></div><div class="metric-foot">${note}</div></article>`;
-}
-
-function agentRow(agent) {
-  return `<div class="agent-row"><span class="agent-avatar">${agent.initials}</span><span class="agent-details"><span class="agent-name">${agent.name}</span><span class="agent-role">${agent.role}</span></span><span class="agent-status ${agent.ready ? 'ready' : ''}"><i></i>${agent.status}</span></div>`;
 }
 
 function eventRows(list) {
@@ -106,11 +91,22 @@ function terminalPanel() {
       <div class="terminal-output" id="terminal-output" aria-live="polite">${terminalLines()}</div>
       <form class="terminal-composer" id="command-form">
         <span class="composer-prompt">❯</span>
-        <input class="terminal-input" id="command-input" maxlength="2000" placeholder="Rozmowa lub polecenie… (@alex, @astyria, @aurelius, @si_1)" autocomplete="off" aria-label="Polecenie terminala" ${commandDisabled ? 'disabled' : ''}>
+        <input class="terminal-input" id="command-input" maxlength="2000" placeholder="Rozmowa lub polecenie…" autocomplete="off" aria-label="Polecenie terminala" ${commandDisabled ? 'disabled' : ''}>
         <button class="icon-button attach-button" type="button" id="attachment-trigger" aria-label="Dodaj obrazy lub wideo" title="Dodaj obrazy lub wideo" ${commandDisabled ? 'disabled' : ''}>${icon('file', 15)}</button>
         <input id="attachment-input" type="file" accept="image/*,video/*" multiple hidden>
         <button class="send-button" type="submit" aria-label="Wyślij polecenie" ${commandDisabled ? 'disabled' : ''}>${icon('send', 15)}</button>
       </form>
+      <section id="user-approval" class="approval-inline" aria-live="polite" hidden>
+        <strong>Wymagana zgoda · zwykły użytkownik</strong>
+        <p>Sprawdź dokładne polecenie przed uruchomieniem:</p>
+        <pre id="user-approval-command" class="root-text"></pre>
+        <p id="user-approval-error" class="root-error" role="status"></p>
+        <label class="root-consent"><input type="checkbox" id="user-approval-consent"> Zatwierdzam dokładnie to polecenie.</label>
+        <div class="heading-actions">
+          <button id="user-approval-approve" class="button primary" type="button" disabled>Wykonaj</button>
+          <button id="user-approval-reject" class="button" type="button">Odrzuć</button>
+        </div>
+      </section>
       <div class="attachment-preview" id="attachment-preview">${pendingMediaFiles.map((file, index) => `<span class="attachment-chip">${icon(file.type.startsWith('video/') ? 'image' : 'file', 13)} ${escapeHtml(file.name)}<button type="button" data-remove-attachment="${index}" aria-label="Usuń załącznik ${escapeHtml(file.name)}">×</button></span>`).join('')}</div>
       <div class="terminal-caption">Zwykły tekst obsługuje aktywny dostawca (Gemini/Ollama), a obrazy trafiają lokalnie do Llama Vision przez Ollama. Z wideo analizowane są maksymalnie dwie klatki. Nie wysyłaj sekretów. Polecenia systemowe wymagają zgody i działają jako użytkownik serwera.</div>
       <p id="user-command-error" class="root-error" role="alert"></p>
@@ -120,33 +116,30 @@ function terminalPanel() {
 }
 
 function dashboardPage() {
-  return `<section class="hero"><div class="hero-glow" aria-hidden="true"></div><div class="hero-main"><div class="eyebrow"><i class="live-dot"></i> SYSTEM ONLINE · HYPERSPACE DESKTOP</div><h1>Enter the <span class="gradient-text">Hyperspace</span></h1><p class="hero-copy">Jeden pulpit dla poleceń jądra, kanałów agentów i lokalnego modelu. Wybierz moduł albo napisz do terminala swobodnie.</p><div class="heading-actions"><button class="button primary" data-page-link="terminal">${icon('terminal', 14)} Pełny terminal ${icon('arrow', 12)}</button><button class="button" data-page-link="hyperspace">${icon('shield', 14)} Hiperterminal root ${icon('arrow', 12)}</button><button class="button" data-page-link="agents">${icon('users', 14)} Kanały agentów ${icon('arrow', 12)}</button><button class="button subtle" data-action="refresh">${icon('refresh', 14)} Odśwież widok</button></div></div><div class="hero-chips"><span class="chip ok">JĄDRO: PODGLĄD</span><span class="chip">GEMINI 3.1 FLASH-LITE</span><span class="chip">OLLAMA · FALLBACK</span><span class="chip accent">PROTOKÓŁ AGENTÓW · SPSC</span></div></section>
-    <div class="metric-grid">${metricCard('Pamięć systemu', '30', 'GiB pool', 'STATIC · PODGLĄD', 'memory', '#a9dc72')}${metricCard('Kolejka agentów', '04', 'kanały', 'SPSC · READY', 'users', '#7fc8a1')}${metricCard('ChronoLog', '64', 'sloty', 'RING BUFFER · IDLE', 'activity', '#d6b56f')}${metricCard('Model lokalny', '7.8', 'GB', 'WAGI W CACHE', 'layers', '#95be79')}</div>
-  <div class="dashboard-grid"><div class="stack">${terminalPanel()}<section class="panel"><div class="panel-head"><div class="panel-title"><span class="section-icon">${icon('activity')}</span>Ostatnia aktywność</div><button class="button small subtle" data-page-link="chronolog">Pełny rejestr ${icon('arrow', 12)}</button></div><div class="panel-body" style="padding:0"><table class="activity-table"><thead><tr><th>Czas</th><th>Źródło</th><th>Zdarzenie</th><th>Wynik</th></tr></thead><tbody id="activity-rows">${eventRows(events.slice(0, 4))}</tbody></table></div></section></div><aside class="stack"><section class="panel"><div class="panel-head"><div class="panel-title"><span class="section-icon">${icon('users')}</span>Agenci</div><span class="panel-meta">4 KANAŁY</span></div><div class="panel-body"><div class="agent-list">${agents.map(agentRow).join('')}</div><button class="button small subtle" style="width:100%;margin-top:14px" data-page-link="agents">Zarządzaj kanałami ${icon('arrow', 12)}</button></div></section><section class="panel"><div class="panel-head"><div class="panel-title"><span class="section-icon">${icon('layers')}</span>Runtime modelu</div><span class="panel-meta">OLLAMA</span></div><div class="panel-body"><div class="runtime-row"><span class="runtime-logo">${icon('image', 17)}</span><span><span class="runtime-name">llama3.2-vision</span><span class="runtime-detail">Wagi Q4_K_M zapisane lokalnie. Działa na Ollama 0.6.8 (silnik Go); starsze wersje nie znają architektury mllama.</span><span class="runtime-tag">CACHE READY · INFERENCE OK</span></span></div></div></section><section class="panel"><div class="panel-head"><div class="panel-title"><span class="section-icon">${icon('shield')}</span>Granica bezpieczeństwa</div><span class="panel-meta">RING 0</span></div><div class="panel-body"><div class="agent-row" style="padding-top:0;border:0"><span class="agent-avatar">${icon('shield', 16)}</span><span class="agent-details"><span class="agent-name">HyperShield</span><span class="agent-role">Prywatny stan jądra · blokada aktywna</span></span><span class="agent-status ready"><i></i>LOCKED</span></div></div></section></aside></div>
+  return `<section class="hero"><div class="hero-glow" aria-hidden="true"></div><div class="hero-main"><div class="eyebrow"><i class="live-dot"></i> SYSTEM ONLINE · HYPERSPACE DESKTOP</div><h1>Enter the <span class="gradient-text">Hyperspace</span></h1><p class="hero-copy">Jeden pulpit dla poleceń jądra, i lokalnego modelu. Wybierz moduł albo napisz do terminala swobodnie.</p><div class="heading-actions"><button class="button primary" data-page-link="terminal">${icon('terminal', 14)} Pełny terminal ${icon('arrow', 12)}</button><button class="button" data-page-link="hyperspace">${icon('shield', 14)} Hiperterminal root ${icon('arrow', 12)}</button><button class="button" data-page-link="repo">${icon('file', 14)} Zmiany w repozytorium ${icon('arrow', 12)}</button><button class="button subtle" data-action="refresh">${icon('refresh', 14)} Odśwież widok</button></div></div><div class="hero-chips"><span class="chip ok">JĄDRO: PODGLĄD</span><span class="chip">GEMINI 3.1 FLASH-LITE</span><span class="chip">OLLAMA · FALLBACK</span><span class="chip accent">SPSC</span></div></section>
+    <div class="metric-grid">${metricCard('Pamięć systemu', '30', 'GiB pool', 'STATIC · PODGLĄD', 'memory', '#a9dc72')}${metricCard('ChronoLog', '64', 'sloty', 'RING BUFFER · IDLE', 'activity', '#d6b56f')}${metricCard('Model lokalny', '7.8', 'GB', 'WAGI W CACHE', 'layers', '#95be79')}</div>
+  <div class="dashboard-grid"><div class="stack">${terminalPanel()}<section class="panel"><div class="panel-head"><div class="panel-title"><span class="section-icon">${icon('activity')}</span>Ostatnia aktywność</div><button class="button small subtle" data-page-link="chronolog">Pełny rejestr ${icon('arrow', 12)}</button></div><div class="panel-body" style="padding:0"><table class="activity-table"><thead><tr><th>Czas</th><th>Źródło</th><th>Zdarzenie</th><th>Wynik</th></tr></thead><tbody id="activity-rows">${eventRows(events.slice(0, 4))}</tbody></table></div></section></div><aside class="stack"><section class="panel"><div class="panel-head"><div class="panel-title"><span class="section-icon">${icon('layers')}</span>Runtime modelu</div><span class="panel-meta">OLLAMA</span></div><div class="panel-body"><div class="runtime-row"><span class="runtime-logo">${icon('image', 17)}</span><span><span class="runtime-name">llama3.2-vision</span><span class="runtime-detail">Wagi Q4_K_M zapisane lokalnie. Działa na Ollama 0.6.8 (silnik Go); starsze wersje nie znają architektury mllama.</span><span class="runtime-tag">CACHE READY · INFERENCE OK</span></span></div></div></section><section class="panel"><div class="panel-head"><div class="panel-title"><span class="section-icon">${icon('shield')}</span>Granica bezpieczeństwa</div><span class="panel-meta">RING 0</span></div><div class="panel-body"><div class="status-row" style="padding-top:0;border:0"><span class="status-avatar">${icon('shield', 16)}</span><span class="status-details"><span class="status-name">HyperShield</span><span class="status-role">Prywatny stan jądra · blokada aktywna</span></span><span class="status-status ready"><i></i>LOCKED</span></div></div></section></aside></div>
   <section class="modules"><div class="modules-head"><h2><i class="live-dot"></i> Moduły systemowe</h2><span class="panel-meta">CACTUSOS · NARZĘDZIA HYPEROS</span></div><div class="module-grid">${[
-    ['terminal', 'terminal', 'Terminal', 'Rozmowa z modelem lokalnym i agentami', '03'],
+    ['terminal', 'terminal', 'Terminal', 'Rozmowa z modelem lokalnym', '03'],
     ['hyperspace', 'shield', 'Hiperterminal root', 'Polecenia root po lokalnym zatwierdzeniu', 'ROOT'],
-    ['agents', 'users', 'Agenci', 'Alex, Astyria, Aurelius, SI_1', '02'],
+    ['repo', 'file', 'Repozytorium', 'Propozycje zmian z zatwierdzeniem diffu', '02'],
     ['chronolog', 'activity', 'ChronoLog', 'Rejestr zdarzeń systemowych', '04'],
     ['models', 'layers', 'Modele', 'Wagi lokalne i runtime Ollama', '05'],
     ['settings', 'sliders', 'Ustawienia', 'Preferencje interfejsu', '06'],
   ].map(([page, symbol, name, description, code]) => `<button class="module-card" data-page-link="${page}"><span class="module-top"><span class="module-symbol">${icon(symbol, 16)}</span><span class="module-code">${code}</span></span><span class="module-name">${name}</span><span class="module-description">${description}</span></button>`).join('')}</div></section>`;
 }
 
-function agentsPage() {
-  const missionAgents = Object.entries(AGENT_ROLES).map(([key, role]) => {
-    const result = missionState?.agents[key];
-    const status = result?.status || 'Oczekuje';
-    const response = result?.reply || 'Odpowiedź pojawi się po wysłaniu misji.';
-    return `<article class="mission-card"><div class="mission-card-head"><strong>${role[0]}</strong><span class="mission-agent-status ${result?.status === 'Błąd' ? 'error' : ''}">${escapeHtml(status)}</span></div><p class="mission-response" data-mission-agent="${key}">${escapeHtml(response)}</p></article>`;
-  }).join('');
-  const repoFileOptions = repoFiles.map(path => `<label class="repo-file-option"><input type="checkbox" data-repo-file="${escapeHtml(path)}" ${repoSelectedFiles.includes(path) ? 'checked' : ''} ${repoBusy || repoChanges ? 'disabled' : ''}><span>${escapeHtml(path)}</span></label>`).join('');
-  const repoProposal = repoChanges ? `<div class="repo-proposal"><div class="mission-current"><strong>Proponowany diff · ${repoChanges.changes.length} plików</strong><p>Sprawdź każdą zmianę poniżej. Zapis dotyczy wyłącznie pokazanych plików.</p></div>${repoChanges.changes.map(change => `<article class="repo-diff"><strong>${escapeHtml(change.path)}</strong><pre>${escapeHtml(change.diff)}</pre></article>`).join('')}<label class="repo-consent"><input type="checkbox" id="repo-change-consent" ${repoBusy ? 'disabled' : ''}> Sprawdziłem diff i zatwierdzam zapis tych zmian w repozytorium.</label><div class="heading-actions"><button class="button primary" id="repo-change-approve" disabled>Zapisz zatwierdzone zmiany</button><button class="button" id="repo-change-reject" ${repoBusy ? 'disabled' : ''}>Odrzuć propozycję</button></div></div>` : '';
-  return `<div class="page-heading"><div><div class="eyebrow">GEMINI 3.1 FLASH-LITE · OLLAMA FALLBACK</div><h1>Rozmowa z agentami</h1><p class="page-subtitle">Cztery role jednego modelu, każda z własną historią rozmowy.</p></div></div>
-    <div class="agent-cards">${agents.map(agent => `<article class="agent-card"><span class="agent-avatar">${agent.initials}</span><div class="agent-name">${agent.name}</div><div class="agent-role">${agent.role}</div></article>`).join('')}</div>
-    <section class="panel mission-panel"><div class="panel-head"><div class="panel-title"><span class="section-icon">${icon('send')}</span>Misja dla wszystkich agentów</div><span class="panel-meta">4 NIEZALEŻNE ODPOWIEDZI</span></div><div class="panel-body"><form id="mission-form" class="mission-form"><label class="sr-only" for="mission-input">Treść wspólnej misji</label><textarea id="mission-input" maxlength="2000" placeholder="Opisz misję lub problem do przeanalizowania…" ${missionBusy ? 'disabled' : ''}></textarea><button class="button primary" type="submit" ${missionBusy ? 'disabled' : ''}>${icon('send', 14)} ${missionBusy ? 'Wysyłanie…' : 'Wyślij misję'}</button></form><p class="mission-note">Każdy agent odpowiada osobno przez skonfigurowany model. To analiza i rekomendacje — nic nie jest wykonywane automatycznie.</p>${missionState ? `<div class="mission-current"><strong>Ostatnia misja</strong><p>${escapeHtml(missionState.text)}</p><div class="mission-results" aria-live="polite">${missionAgents}</div></div>` : ''}</div></section>
-    <section class="panel mission-panel"><div class="panel-head"><div class="panel-title"><span class="section-icon">${icon('file')}</span>Propozycja zmian w repozytorium</div><span class="panel-meta">ZAPIS PO TWOJEJ ZGODZIE</span></div><div class="panel-body"><p class="mission-note repo-disclosure">Wybrane pliki zostaną wysłane do Gemini razem z opisem zadania. Agent może zaproponować edycję wybranych plików lub utworzenie nowych w istniejących katalogach. Nie ma dostępu do powłoki ani plików sekretów.</p><form id="repo-change-form"><div class="repo-controls"><label>Agent<select id="repo-agent" ${repoBusy || repoChanges ? 'disabled' : ''}>${Object.entries(AGENT_ROLES).map(([key, role]) => `<option value="${key}" ${key === repoSelectedAgent ? 'selected' : ''}>${role[0]}</option>`).join('')}</select></label><textarea id="repo-mission" aria-label="Zadanie dla agenta" maxlength="2000" placeholder="Opisz dokładnie, co ma zostać utworzone lub zmienione…" ${repoBusy || repoChanges ? 'disabled' : ''}></textarea></div><div class="repo-files-head"><strong>Pliki do udostępnienia agentowi</strong><button class="button small subtle" type="button" id="repo-files-refresh" ${repoBusy || repoChanges || repoFilesLoading ? 'disabled' : ''}>${repoFilesLoading ? 'Odświeżanie…' : 'Odśwież listę'}</button></div><div class="repo-file-list" id="repo-file-list">${repoFilesLoaded ? repoFileOptions || '<p class="mission-note">Nie znaleziono dostępnych plików tekstowych.</p>' : repoFilesLoading ? '<p class="mission-note">Wczytuję listę plików…</p>' : '<p class="mission-note">Lista plików jest niedostępna.</p>'}</div>${repoFilesError ? `<p class="repo-error" role="alert">${escapeHtml(repoFilesError)}</p>` : ''}${repoChangeError ? `<p class="repo-error" role="alert">${escapeHtml(repoChangeError)}</p>` : ''}<button class="button primary repo-propose-button" type="submit" ${repoBusy || repoChanges || !repoFilesLoaded ? 'disabled' : ''}>${repoBusy ? 'Przygotowuję / zapisuję…' : 'Przygotuj diff do sprawdzenia'}</button></form>${repoProposal}</div></section>
-    <div class="agent-chat-picker"><label for="chat-agent">Rozmówca</label><select id="chat-agent" aria-label="Agent rozmowy" ${chatBusy ? 'disabled' : ''}>${Object.entries(AGENT_ROLES).map(([key, role]) => `<option value="${key}" ${key === selectedChatAgent ? 'selected' : ''}>${role[0]}</option>`).join('')}</select></div>
+function repoPage() {
+  const repoFileOptions = repoFiles.map(path => `<label class="repo-file-option"><input type="checkbox" data-repo-file="${escapeHtml(path)}" ${repoSelectedFiles.includes(path) ? 'checked' : ''} ${repoBusy ? 'disabled' : ''}><span>${escapeHtml(path)}</span></label>`).join('');
+  const repoQueueItems = repoQueue.map(proposal => `<article class="repo-diff repo-queue-item"><div class="repo-queue-head"><strong>Propozycja zmian · ${proposal.changes.length} plików</strong><span>${proposal.expires_in}s</span></div>${proposal.changes.map(change => `<div class="repo-queue-change"><strong>${escapeHtml(change.path)}</strong><pre>${escapeHtml(change.diff)}</pre></div>`).join('')}<label class="repo-consent"><input type="checkbox" data-repo-consent="${escapeHtml(proposal.proposal_id)}" ${repoBusy ? 'disabled' : ''}> Sprawdziłem diff i zatwierdzam zapis tych zmian.</label><div class="heading-actions"><button class="button primary" data-repo-approve="${escapeHtml(proposal.proposal_id)}" type="button" disabled ${repoBusy ? 'disabled' : ''}>Zapisz zatwierdzone zmiany</button><button class="button" data-repo-reject="${escapeHtml(proposal.proposal_id)}" type="button" ${repoBusy ? 'disabled' : ''}>Odrzuć</button></div></article>`).join('');
+  const repoQueueContent = repoQueueError
+    ? `<p class="repo-error" role="alert">${escapeHtml(repoQueueError)}</p>`
+    : repoQueueLoading && !repoQueue.length
+      ? '<p class="mission-note">Sprawdzam kolejkę oczekujących propozycji…</p>'
+      : repoQueueItems || '<p class="mission-note">Brak oczekujących próśb o utworzenie lub zmianę plików.</p>';
+  return `<div class="page-heading"><div><div class="eyebrow">GEMINI 3.1 FLASH-LITE · OLLAMA FALLBACK</div><h1>Zmiany w repozytorium</h1><p class="page-subtitle">Model proponuje diff; zapis następuje dopiero po Twojej zgodzie.</p></div></div>
+    <section class="panel mission-panel"><div class="panel-head"><div class="panel-title"><span class="section-icon">${icon('file')}</span>Kolejka próśb o akceptację</div><span class="panel-meta" id="repo-queue-count">${repoQueue.length} OCZEKUJE</span><button class="button small subtle" type="button" id="repo-queue-refresh" ${repoQueueLoading ? 'disabled' : ''}>${repoQueueLoading ? 'Sprawdzam…' : 'Odśwież kolejkę'}</button></div><div class="panel-body"><div id="repo-approval-queue">${repoQueueContent}</div></div></section>
+    <section class="panel mission-panel"><div class="panel-head"><div class="panel-title"><span class="section-icon">${icon('file')}</span>Przygotuj nową prośbę o zmiany</div><span class="panel-meta">ZAPIS PO TWOJEJ ZGODZIE</span></div><div class="panel-body"><p class="mission-note repo-disclosure">Wybrane pliki zostaną wysłane do Gemini razem z opisem zadania. Model może zaproponować edycję wybranych plików lub utworzenie nowych w istniejących katalogach. Nie ma dostępu do powłoki ani plików sekretów.</p><form id="repo-change-form"><div class="repo-controls"><textarea id="repo-mission" aria-label="Zadanie" maxlength="2000" placeholder="Opisz dokładnie, co ma zostać utworzone lub zmienione…" ${repoBusy ? 'disabled' : ''}></textarea></div><div class="repo-files-head"><strong>Pliki do udostępnienia modelowi</strong><button class="button small subtle" type="button" id="repo-files-refresh" ${repoBusy || repoFilesLoading ? 'disabled' : ''}>${repoFilesLoading ? 'Odświeżanie…' : 'Odśwież listę'}</button></div><div class="repo-file-list" id="repo-file-list">${repoFilesLoaded ? repoFileOptions || '<p class="mission-note">Nie znaleziono dostępnych plików tekstowych.</p>' : repoFilesLoading ? '<p class="mission-note">Wczytuję listę plików…</p>' : '<p class="mission-note">Lista plików jest niedostępna.</p>'}</div>${repoFilesError ? `<p class="repo-error" role="alert">${escapeHtml(repoFilesError)}</p>` : ''}${repoChangeError ? `<p class="repo-error" role="alert">${escapeHtml(repoChangeError)}</p>` : ''}<button class="button primary repo-propose-button" type="submit" ${repoBusy || !repoFilesLoaded ? 'disabled' : ''}>${repoBusy ? 'Przygotowuję…' : 'Przygotuj diff do sprawdzenia'}</button></form></div></section>
     ${terminalPanel()}`;
 }
 
@@ -166,7 +159,7 @@ function settingsPage() {
   return `<div class="page-heading"><div><div class="eyebrow"><i class="live-dot"></i> PREFERENCJE</div><h1>Ustawienia panelu</h1><p class="page-subtitle">Lokalne preferencje interfejsu, bez modyfikacji konfiguracji kernela.</p></div></div><div class="content-grid"><section class="panel"><div class="panel-head"><div class="panel-title"><span class="section-icon">${icon('sliders')}</span>Interfejs</div><span class="panel-meta">LOCAL</span></div><div class="panel-body"><div class="setting-row"><div><div class="setting-name">Animacje interfejsu</div><div class="setting-note">Przejścia i delikatne wejście paneli</div></div><button class="toggle on" data-toggle aria-label="Przełącz animacje"></button></div><div class="setting-row"><div><div class="setting-name">Odświeżanie zegara</div><div class="setting-note">Lokalny czas przeglądarki</div></div><button class="toggle on" data-toggle aria-label="Przełącz zegar"></button></div><div class="setting-row"><div><div class="setting-name">Zapis historii demo</div><div class="setting-note">Historia pozostaje tylko w pamięci strony</div></div><button class="toggle" data-toggle aria-label="Przełącz zapis historii"></button></div></div></section><section class="panel"><div class="panel-head"><div class="panel-title"><span class="section-icon">${icon('shield')}</span>O systemie</div></div><div class="panel-body"><div class="setting-row"><span class="setting-name">Build UI</span><span class="log-code">CACTUS-0.1.0</span></div><div class="setting-row"><span class="setting-name">Motyw</span><span class="log-code">BASTILLA / DARK</span></div><div class="setting-row"><span class="setting-name">Połączenie kernel</span><span class="log-level warn">NIEPODŁĄCZONE</span></div></div></section></div>`;
 }
 
-const renderers = { hyperspace: rootTerminalPage, dashboard: dashboardPage, agents: agentsPage, terminal: terminalPage, chronolog: chronologPage, models: modelsPage, settings: settingsPage };
+const renderers = { hyperspace: rootTerminalPage, dashboard: dashboardPage, repo: repoPage, terminal: terminalPage, chronolog: chronologPage, models: modelsPage, settings: settingsPage };
 
 function renderPage(name = currentPage) {
   currentPage = name in renderers ? name : 'dashboard';
@@ -176,29 +169,25 @@ function renderPage(name = currentPage) {
   navButtons.forEach((button) => button.classList.toggle('active', button.dataset.page === currentPage));
   pageContent.innerHTML = renderers[currentPage]();
   bindPageActions();
-  syncApprovalDialog();
 }
 
 function bindPageActions() {
   bindRootTerminal();
   bindUserTerminal();
-  pageContent.querySelector('#mission-form')?.addEventListener('submit', onMissionSubmit);
   pageContent.querySelector('#repo-change-form')?.addEventListener('submit', onRepositoryChangeSubmit);
   pageContent.querySelector('#repo-files-refresh')?.addEventListener('click', loadRepositoryFiles);
-  pageContent.querySelector('#repo-agent')?.addEventListener('change', event => {
-    repoSelectedAgent = event.target.value;
-  });
   pageContent.querySelectorAll('[data-repo-file]').forEach(input => input.addEventListener('change', () => {
     repoSelectedFiles = [...pageContent.querySelectorAll('[data-repo-file]:checked')].map(file => file.dataset.repoFile);
   }));
-  pageContent.querySelector('#repo-change-consent')?.addEventListener('change', event => {
-    const approve = pageContent.querySelector('#repo-change-approve');
-    if (approve) approve.disabled = !event.target.checked || repoBusy;
+  pageContent.querySelector('#repo-queue-refresh')?.addEventListener('click', loadRepositoryQueue);
+  pageContent.querySelector('#repo-approval-queue')?.addEventListener('change', event => {
+    if (event.target.matches('[data-repo-consent]')) syncRepoApprovalButtons();
   });
-  pageContent.querySelector('#repo-change-approve')?.addEventListener('click', () => resolveRepositoryChange(true));
-  pageContent.querySelector('#repo-change-reject')?.addEventListener('click', () => resolveRepositoryChange(false));
-  pageContent.querySelector('#chat-agent')?.addEventListener('change', event => {
-    selectedChatAgent = event.target.value;
+  pageContent.querySelector('#repo-approval-queue')?.addEventListener('click', event => {
+    const approve = event.target.closest('[data-repo-approve]');
+    const reject = event.target.closest('[data-repo-reject]');
+    if (approve) resolveRepositoryChange(true, approve.dataset.repoApprove);
+    if (reject) resolveRepositoryChange(false, reject.dataset.repoReject);
   });
   pageContent.querySelectorAll('[data-page-link]').forEach((button) => button.addEventListener('click', () => renderPage(button.dataset.pageLink)));
   pageContent.querySelectorAll('[data-action="refresh"]').forEach((button) => button.addEventListener('click', () => { updateClock(); showToast('Widok odświeżony · dane demonstracyjne'); }));
@@ -230,7 +219,17 @@ function bindPageActions() {
   }));
   const output = pageContent.querySelector('#terminal-output');
   if (output) output.scrollTop = output.scrollHeight;
-  if (currentPage === 'agents' && !repoFilesAttempted && !repoFilesLoading) loadRepositoryFiles();
+  if (currentPage === 'repo') {
+    if (!repoFilesAttempted && !repoFilesLoading) loadRepositoryFiles();
+    if (repoQueueTimer) clearInterval(repoQueueTimer);
+    repoQueueTimer = setInterval(() => {
+      if (!repoBusy) loadRepositoryQueue();
+    }, 4000);
+    loadRepositoryQueue();
+  } else if (repoQueueTimer) {
+    clearInterval(repoQueueTimer);
+    repoQueueTimer = null;
+  }
 }
 
 function updateTerminalOutput(entry) {
@@ -350,24 +349,12 @@ async function prepareMediaFiles(files) {
   return { images, labels };
 }
 
-function setMissionAgentResult(agentKey, status, reply) {
-  missionState.agents[agentKey] = { status, reply };
-  if (currentPage !== 'agents') return;
-  const card = pageContent.querySelector(`[data-mission-agent="${agentKey}"]`);
-  const statusNode = card?.closest('.mission-card')?.querySelector('.mission-agent-status');
-  if (card) card.textContent = reply;
-  if (statusNode) {
-    statusNode.textContent = status;
-    statusNode.classList.toggle('error', status === 'Błąd');
-  }
-}
-
 async function loadRepositoryFiles() {
   if (repoFilesLoading) return;
   repoFilesAttempted = true;
   repoFilesLoading = true;
   repoFilesError = '';
-  if (currentPage === 'agents') renderPage('agents');
+  if (currentPage === 'repo') renderPage('repo');
   try {
     const response = await fetch('/api/repo/files', { cache: 'no-store' });
     const result = await response.json();
@@ -379,8 +366,60 @@ async function loadRepositoryFiles() {
     repoFilesError = `Nie udało się wczytać plików repozytorium: ${error.message}`;
   } finally {
     repoFilesLoading = false;
-    if (currentPage === 'agents') renderPage('agents');
+    if (currentPage === 'repo') renderPage('repo');
   }
+}
+
+async function loadRepositoryQueue() {
+  if (repoQueueLoading) return;
+  repoQueueLoading = true;
+  repoQueueError = '';
+  renderRepositoryQueue();
+  try {
+    const response = await fetch('/api/repo/pending', { cache: 'no-store' });
+    const result = await response.json();
+    if (!response.ok) throw new Error(result.error || `HTTP ${response.status}`);
+    if (!Array.isArray(result.proposals)) throw new Error('Nieprawidłowa odpowiedź kolejki');
+    repoQueue = result.proposals;
+  } catch (error) {
+    repoQueueError = `Nie udało się wczytać kolejki akceptacji: ${error.message}`;
+  } finally {
+    repoQueueLoading = false;
+    renderRepositoryQueue();
+  }
+}
+
+function renderRepositoryQueue() {
+  if (currentPage !== 'repo') return;
+  const queue = pageContent.querySelector('#repo-approval-queue');
+  if (!queue) return;
+  const count = pageContent.querySelector('#repo-queue-count');
+  if (count) count.textContent = `${repoQueue.length} OCZEKUJE`;
+  const refresh = pageContent.querySelector('#repo-queue-refresh');
+  if (refresh) {
+    refresh.disabled = repoQueueLoading;
+    refresh.textContent = repoQueueLoading ? 'Sprawdzam…' : 'Odśwież kolejkę';
+  }
+  if (repoQueueError) {
+    queue.innerHTML = `<p class="repo-error" role="alert">${escapeHtml(repoQueueError)}</p>`;
+    return;
+  }
+  if (!repoQueue.length) {
+    queue.innerHTML = `<p class="mission-note">${repoQueueLoading
+      ? 'Sprawdzam kolejkę oczekujących propozycji…'
+      : 'Brak oczekujących próśb o utworzenie lub zmianę plików.'}</p>`;
+    return;
+  }
+  queue.innerHTML = repoQueue.map(proposal => `<article class="repo-diff repo-queue-item"><div class="repo-queue-head"><strong>Prośba do akceptacji · ${proposal.changes.length} plików</strong><span>Wygasa za ${proposal.expires_in}s</span></div>${proposal.changes.map(change => `<div class="repo-queue-change"><strong>${escapeHtml(change.path)}</strong><pre>${escapeHtml(change.diff)}</pre></div>`).join('')}<label class="repo-consent"><input type="checkbox" data-repo-consent="${escapeHtml(proposal.proposal_id)}" ${repoBusy ? 'disabled' : ''}> Sprawdziłem diff i zatwierdzam zapis tych zmian.</label><div class="heading-actions"><button class="button primary" data-repo-approve="${escapeHtml(proposal.proposal_id)}" type="button" disabled ${repoBusy ? 'disabled' : ''}>Zapisz zatwierdzone zmiany</button><button class="button" data-repo-reject="${escapeHtml(proposal.proposal_id)}" type="button" ${repoBusy ? 'disabled' : ''}>Odrzuć</button></div></article>`).join('');
+}
+
+function syncRepoApprovalButtons() {
+  pageContent.querySelectorAll('[data-repo-approve]').forEach(button => {
+    const proposalId = button.dataset.repoApprove;
+    const consent = [...pageContent.querySelectorAll('[data-repo-consent]')]
+      .find(input => input.dataset.repoConsent === proposalId);
+    button.disabled = repoBusy || !consent?.checked;
+  });
 }
 
 async function onRepositoryChangeSubmit(event) {
@@ -388,46 +427,49 @@ async function onRepositoryChangeSubmit(event) {
   if (repoBusy || chatBusy) return;
   const mission = pageContent.querySelector('#repo-mission').value.trim();
   if (!mission) {
-    showToast('Opisz zadanie dla agenta.');
+    showToast('Opisz zadanie.');
     return;
   }
   if (!repoSelectedFiles.length) {
-    showToast('Wybierz przynajmniej jeden plik jako kontekst dla agenta.');
+    showToast('Wybierz przynajmniej jeden plik jako kontekst.');
     return;
   }
   repoBusy = true;
   chatBusy = true;
   repoChangeError = '';
-  repoChanges = null;
-  renderPage('agents');
+  renderPage('repo');
   try {
     const response = await terminalFetch('/api/repo/propose', {
-      agent: repoSelectedAgent,
       mission,
       paths: repoSelectedFiles,
     });
     const result = await response.json();
     if (!response.ok) throw new Error(`${result.error || 'Błąd serwera'} (HTTP ${response.status})`);
-    repoChanges = result;
+    repoChangeError = `Dodano do kolejki akceptacji (${result.changes.length} plików).`;
   } catch (error) {
     repoChangeError = `Nie udało się przygotować propozycji: ${error.message}`;
   } finally {
     repoBusy = false;
     chatBusy = false;
-    if (currentPage === 'agents') renderPage('agents');
+    if (currentPage === 'repo') renderPage('repo');
   }
 }
 
-async function resolveRepositoryChange(approved) {
-  if (repoBusy || !repoChanges) return;
-  if (approved && !pageContent.querySelector('#repo-change-consent')?.checked) return;
+async function resolveRepositoryChange(approved, proposalId) {
+  const proposal = repoQueue.find(item => item.proposal_id === proposalId);
+  if (repoBusy || !proposal) return;
+  if (approved) {
+    const consent = [...pageContent.querySelectorAll('[data-repo-consent]')]
+      .find(input => input.dataset.repoConsent === proposalId);
+    if (!consent?.checked) return;
+  }
   repoBusy = true;
   chatBusy = true;
   repoChangeError = '';
-  renderPage('agents');
+  renderPage('repo');
   try {
     const response = await terminalFetch('/api/repo/resolve', {
-      proposal_id: repoChanges.proposal_id,
+      proposal_id: proposal.proposal_id,
       approved,
     });
     const result = await response.json();
@@ -437,116 +479,22 @@ async function resolveRepositoryChange(approved) {
     } else {
       repoChangeError = 'Propozycja została odrzucona; pliki nie zostały zmienione.';
     }
-    repoChanges = null;
+    repoQueue = repoQueue.filter(item => item.proposal_id !== proposalId);
   } catch (error) {
     repoChangeError = `Nie udało się zatwierdzić propozycji: ${error.message}`;
-    if (responseInvalidatesProposal(error)) repoChanges = null;
+    if (responseInvalidatesProposal(error)) {
+      repoQueue = repoQueue.filter(item => item.proposal_id !== proposalId);
+    }
   } finally {
     repoBusy = false;
     chatBusy = false;
-    if (currentPage === 'agents') renderPage('agents');
+    if (currentPage === 'repo') renderPage('repo');
     if (approved) loadRepositoryFiles();
   }
 }
 
 function responseInvalidatesProposal(error) {
   return /HTTP (400|409)/.test(error.message);
-}
-
-function syncApprovalDialog() {
-  const pending = userTerminalState.proposal
-    ? { type: 'user', ...userTerminalState }
-    : rootTerminalState.proposal
-      ? { type: 'root', ...rootTerminalState }
-      : null;
-  const key = pending ? `${pending.type}:${pending.proposal.proposal_id}` : '';
-  if (key !== syncApprovalDialog.currentKey) {
-    approvalConsent.checked = false;
-    syncApprovalDialog.currentKey = key;
-  }
-  if (!pending) {
-    if (approvalDialog.open) approvalDialog.close();
-    return;
-  }
-
-  document.querySelector('#approval-title').textContent = pending.type === 'root'
-    ? 'Zatwierdzenie wykonania jako root'
-    : 'Zatwierdzenie polecenia';
-  document.querySelector('#approval-scope').textContent = pending.type === 'root'
-    ? 'UID 0 · ROOT' : 'ZWYKŁY UŻYTKOWNIK';
-  document.querySelector('#approval-command').textContent = pending.proposal.command || '';
-  document.querySelector('#approval-error').textContent = pending.error
-    || (pending.busy ? 'Przetwarzanie decyzji…' : '');
-  const allowed = pending.executionAllowed;
-  document.querySelector('#approval-approve').textContent = pending.busy
-    ? 'Przetwarzanie…' : pending.type === 'root' ? 'Wykonaj jako root' : 'Wykonaj';
-  document.querySelector('#approval-approve').disabled = pending.busy
-    || !allowed || !approvalConsent.checked;
-  document.querySelector('#approval-reject').disabled = pending.busy;
-  approvalConsent.disabled = pending.busy;
-  if (!approvalDialog.open) approvalDialog.showModal();
-}
-
-approvalConsent.addEventListener('change', () => {
-  syncApprovalDialog();
-});
-document.querySelector('#approval-approve').addEventListener('click', () => {
-  if (userTerminalState.proposal) resolveUserProposal(true);
-  else if (rootTerminalState.proposal) resolveRootProposal(true);
-});
-document.querySelector('#approval-reject').addEventListener('click', () => {
-  if (userTerminalState.proposal) resolveUserProposal(false);
-  else if (rootTerminalState.proposal) resolveRootProposal(false);
-});
-approvalDialog.addEventListener('cancel', event => event.preventDefault());
-
-async function onMissionSubmit(event) {
-  event.preventDefault();
-  if (missionBusy || chatBusy) return;
-  const input = pageContent.querySelector('#mission-input');
-  const mission = input.value.trim();
-  if (!mission) return;
-
-  missionBusy = true;
-  chatBusy = true;
-  missionState = {
-    text: mission,
-    agents: Object.fromEntries(Object.keys(AGENT_ROLES).map(key => [key, { status: 'W toku', reply: 'Agent analizuje misję…' }])),
-  };
-  const time = new Date().toLocaleTimeString('pl-PL', { hour12: false });
-  events.unshift({ time, type: 'MISSION', message: `Wysłano misję do 4 agentów · ${mission.slice(0, 60)}`, code: 'AI' });
-  events = events.slice(0, 16);
-  renderPage('agents');
-
-  const tasks = Object.entries(AGENT_ROLES).map(async ([agentKey]) => {
-    const history = chatHistories[agentKey] || (chatHistories[agentKey] = []);
-    const userMessage = { role: 'user', content: mission };
-    history.push(userMessage);
-    try {
-      const reply = await streamChat(buildMissionMessages(history.slice(0, -1), agentKey, mission), partial => {
-        setMissionAgentResult(agentKey, 'W toku', partial);
-      }, undefined, provider => {
-        if (provider) lastChatProvider = provider;
-      });
-      history.push({ role: 'assistant', content: reply });
-      if (history.length > MAX_AGENT_HISTORY_MESSAGES) {
-        history.splice(0, history.length - MAX_AGENT_HISTORY_MESSAGES);
-      }
-      setMissionAgentResult(agentKey, 'Gotowe', reply || '(model nie zwrócił odpowiedzi)');
-    } catch (error) {
-      if (history.at(-1) === userMessage) history.pop();
-      const unreachable = error instanceof TypeError;
-      const message = unreachable
-        ? 'Nie można połączyć się z serwerem CactusOS. Otwórz stronę na porcie 4180 i sprawdź, czy backend działa.'
-        : `Błąd modelu: ${error.message}`;
-      setMissionAgentResult(agentKey, 'Błąd', message);
-    }
-  });
-  await Promise.all(tasks);
-  missionBusy = false;
-  chatBusy = false;
-  if (currentPage === 'agents') renderPage('agents');
-  refreshOllamaStatus();
 }
 
 async function onCommandSubmit(event) {
@@ -560,18 +508,13 @@ async function onCommandSubmit(event) {
 
   if (command.toLowerCase() === 'clear' && !files.length) {
     commandHistory = [];
-    chatHistories = {};
+    chatMessages = [];
     renderPage(currentPage);
     return;
   }
 
-  const parsed = parseCommand(command);
-  const selectedRole = currentPage === 'agents' && !parsed.agent ? AGENT_ROLES[selectedChatAgent] : null;
-  const agent = parsed.agent || (selectedRole && selectedRole[0]);
-  const text = parsed.text;
-  const system = selectedRole
-    ? `${BASE_PROMPT} Odpowiadasz jako ${selectedRole[0]}, rola: ${selectedRole[1]}.`
-    : parsed.system;
+  const text = command;
+  const system = BASE_PROMPT;
   if (!files.length && isCommandExecutionRequest(text)) {
     if (rootTerminalState.busy || rootTerminalState.proposal
         || userTerminalState.busy || userTerminalState.proposal) {
@@ -589,13 +532,11 @@ async function onCommandSubmit(event) {
     submitUserCommand(text, entry);
     return;
   }
-  const channel = agent || 'default';
-  const chatMessages = chatHistories[channel] || (chatHistories[channel] = []);
   const time = new Date().toLocaleTimeString('pl-PL', { hour12: false });
-  const entry = { prompt: agent ? `@${agent} ${text}` : command || 'Załączniki', text: 'Przygotowuję załączniki…', kind: 'response', time };
+  const entry = { prompt: command || 'Załączniki', text: 'Przygotowuję załączniki…', kind: 'response', time };
   commandHistory.push(entry);
   if (commandHistory.length > 18) commandHistory = commandHistory.slice(-18);
-  events.unshift({ time, type: 'CLI', message: `Wpis terminala${agent ? ' · ' + agent : ''} · ${(command || 'załączniki').slice(0, 60)}`, code: 'AI' });
+  events.unshift({ time, type: 'CLI', message: `Wpis terminala · ${(command || 'załączniki').slice(0, 60)}`, code: 'AI' });
   events = events.slice(0, 16);
 
   pendingMediaFiles = [];
@@ -607,7 +548,7 @@ async function onCommandSubmit(event) {
     const media = await prepareMediaFiles(files);
     const content = [text || 'Opisz załączone obrazy.', media.labels.length
       ? `Załączniki: ${media.labels.join(', ')}` : ''].filter(Boolean).join('\n\n');
-    entry.prompt = `${agent ? `@${agent} ` : ''}${text || 'Załączniki'}${media.labels.length ? ` [${media.labels.join(', ')}]` : ''}`;
+    entry.prompt = `${text || 'Załączniki'}${media.labels.length ? ` [${media.labels.join(', ')}]` : ''}`;
     chatMessages.push({ role: 'user', content, ...(media.images.length ? { images: media.images } : {}) });
     userMessageAdded = true;
     let excessImages = chatMessages.reduce((count, message) => count + (message.images?.length || 0), 0) - 4;

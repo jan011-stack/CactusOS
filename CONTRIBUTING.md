@@ -22,7 +22,7 @@ cargo test
 
 ## Code Style
 
-- Python: follow existing style in `si_1_core/`
+- Python: follow existing style in `hyperos/`
 - Rust: `no_std` friendly, no unnecessary allocations
 
 ## Questions

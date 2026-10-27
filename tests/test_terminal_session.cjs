@@ -55,8 +55,7 @@ test('explicit ping requests go to the executor proposal, not ordinary chat', ()
   for (const text of ['Co robi ping?', 'Wyjaśnij ping', 'cześć', 'pingwin']) {
     assert.equal(api.isPingExecutionRequest(text), false, text);
   }
-  const parsed = api.parseCommand('@alex wyślij ping localhost');
-  assert.equal(api.isPingExecutionRequest(parsed.text), true);
+  assert.equal(api.isPingExecutionRequest('wyślij ping localhost'), true);
 });
 
 test('ordinary terminal distinguishes execution requests from conversation', () => {
@@ -95,14 +94,4 @@ test('chat history is capped to twelve messages to bound browser memory', () => 
   assert.equal(history.length, 12);
   assert.equal(history[0].content, 'message 8');
   assert.equal(history.at(-1).content, 'message 19');
-});
-
-test('mission messages are independently framed for each agent and cannot claim execution', () => {
-  const api = client(async () => { throw new Error('No network expected'); });
-  const messages = api.buildMissionMessages([{ role: 'user', content: 'poprzednia rozmowa' }], 'astyria', 'Przeanalizuj problem.');
-  assert.match(messages[0].content, /Odpowiadasz jako Astyria/);
-  assert.match(messages[0].content, /niczego nie wykonuj/);
-  assert.equal(messages[1].content, 'poprzednia rozmowa');
-  assert.equal(messages[2].content, 'Przeanalizuj problem.');
-  assert.throws(() => api.buildMissionMessages([], 'unknown', 'Misja'), /Nieznany agent misji/);
 });

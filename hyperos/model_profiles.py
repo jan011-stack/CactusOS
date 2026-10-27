@@ -1,7 +1,7 @@
 """Local Ollama model resource profiles.
 
 Resource policy:
-- Default ECO profile: small context, 1 thread, unload after each call (keep_alive=0)
+- Default ECO profile: small context, all cores, model kept loaded for 5 minutes
 - BALANCED / QUALITY available via CACTUS_OLLAMA_PROFILE
 """
 
@@ -11,23 +11,23 @@ from typing import Dict
 DEFAULT_MODEL = os.environ.get("CACTUS_OLLAMA_MODEL", "cactus-ai")
 
 # --- Resource profiles (RAM / CPU) ---
-# ECO: minimal footprint for weak machines / always-on agents
+# ECO: minimal footprint for weak machines
 # BALANCED: slightly more quality without blowing memory
 # QUALITY: only when operator explicitly opts in
 _PROFILES: Dict[str, dict] = {
     "eco": {
         "num_ctx": 2048,
-        "num_batch": 2,
-        "num_thread": 1,
+        "num_batch": 64,
+        "num_thread": 4,
         "num_predict": 1024,
         "temperature": 0.1,
-        "keep_alive": 0,       # unload weights after reply → frees RAM
+        "keep_alive": "5m",
         "max_history": 8,
     },
     "balanced": {
         "num_ctx": 3072,
-        "num_batch": 2,
-        "num_thread": 2,
+        "num_batch": 128,
+        "num_thread": 4,
         "num_predict": 1536,
         "temperature": 0.2,
         "keep_alive": "2m",    # short cache, then free
@@ -35,7 +35,7 @@ _PROFILES: Dict[str, dict] = {
     },
     "quality": {
         "num_ctx": 4096,
-        "num_batch": 4,
+        "num_batch": 256,
         "num_thread": 4,
         "num_predict": 2048,
         "temperature": 0.3,

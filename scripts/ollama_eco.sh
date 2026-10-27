@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# si_1: start / tune Ollama for low RAM & CPU
+# Start / tune Ollama for low RAM & CPU
 set -euo pipefail
 
 export OLLAMA_HOST="${OLLAMA_HOST:-127.0.0.1:11434}"

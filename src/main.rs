@@ -7,13 +7,11 @@ use core::ptr::NonNull;
 use sha2::{Digest, Sha256};
 
 use hyperos_core::chrono_log::{ChronoLogEngine, LogEntry};
-use hyperos_core::hyper_agent_bridge::HyperAgentBridge;
 use hyperos_core::hyper_allocator::HyperAllocator;
 use hyperos_core::hyper_bridge_loop::{HyperBridgeLoop, LoopProgress, NonBlockingOutput};
 use hyperos_core::hyper_chrono_guard::HyperChronoGuard;
 use hyperos_core::hyper_diagnostics::run_post_validation;
 use hyperos_core::hyper_euler_engine::compute_euler_rotation;
-use hyperos_core::si_bridge;
 use hyperos_core::hyper_ollama_client::{IoError, NonBlockingSocket};
 use hyperos_core::hyper_scheduler::HyperScheduler;
 use hyperos_core::hyper_shield::{HyperShieldController, SecurityRing};
@@ -226,7 +224,6 @@ pub extern "C" fn _start() -> ! {
         panic!("HyperOS: scheduler initialization failed");
     }
     let mut shield = HyperShieldController::new();
-    let mut agent_bridge = HyperAgentBridge::new();
     let mut update_engine = HyperUpdateEngine::new();
     let mut update_guard = HyperChronoGuard::new();
     let mut chat_log = ChronoLogEngine::new();
@@ -251,21 +248,12 @@ pub extern "C" fn _start() -> ! {
     };
     let mut request_active = false;
     let mut kv_cursor = 0usize;
-    let (mut producers, mut consumers) = agent_bridge.split();
-
-    // SAFETY: the token is 32 readable bytes and the loop below is single-threaded.
-    if !unsafe { si_bridge::establish_cognitive_link(si_bridge::LINK_TOKEN.as_ptr()) } {
-        panic!("HyperOS: cognitive link rejected");
-    }
 
     loop {
         let ticks = unsafe { hyperos_clock_ticks() };
 
         let phase = (ticks & 7) as f64;
         let _ = scheduler.run_slice(phase);
-        for consumer in consumers.iter_mut() {
-            let _ = consumer.try_receive();
-        }
 
         match update_engine.poll(
             &mut update_socket,
@@ -319,20 +307,16 @@ pub extern "C" fn _start() -> ! {
                 {
                     response_reader.reset();
                     if request_loop
-                        .begin(&terminal, &mut producers[0], prompt, image)
+                        .begin(&terminal, prompt, image)
                         .is_ok()
                     {
                         snapshot.timestamp = ticks;
-                        snapshot.context_id = producers[0].identity() as u32;
+                        snapshot.context_id = 0;
                         let prompt_text = core::str::from_utf8(prompt).unwrap_or("");
                         let vector_ok = terminal.process_text_command(
                             prompt_text,
                             &mut snapshot.status_snapshot,
                         );
-                        // SAFETY: `prompt` is `prompt_length` readable bytes; single-threaded loop.
-                        let linked_slots = unsafe {
-                            si_bridge::broadcast_to_agents(prompt.as_ptr(), prompt.len())
-                        };
                         if image_length != 0 {
                             let mut projection_pointer = core::ptr::null();
                             let mut projection_length = 0usize;
@@ -372,7 +356,7 @@ pub extern "C" fn _start() -> ! {
                                     if kv_cursor == kv_cache.len() {
                                         kv_cursor = 0;
                                     }
-                                    if let Ok(token) = vision_engine.process_step(
+                                    let _ = vision_engine.process_step(
                                         &snapshot.status_snapshot,
                                         image,
                                         image_width,
@@ -381,25 +365,17 @@ pub extern "C" fn _start() -> ! {
                                         phase,
                                         kv_cache,
                                         &mut kv_cursor,
-                                    ) {
-                                        let _ = producers[0].publish_vision_token(&token);
-                                    }
+                                    );
                                 }
                             }
                         }
-                        // Astyria (0x02): Ring-0 boundary check of the command vector.
+                        // Ring-0 boundary check of the command vector.
                         let boundary_ok = vector_ok
-                            && linked_slots == 4
                             && terminal.validate_orthogonal(&snapshot.status_snapshot);
-                        // Alex (0x01) logs the vector, Aurelius (0x03) the registry entry.
                         log_event(&chat_log, snapshot);
-                        let mut registry = snapshot;
-                        registry.context_id = si_bridge::ID_AURELIUS as u32;
-                        log_event(&chat_log, registry);
-                        // SI_1 (0x04): Euler phase transform of the current tick.
+                        // Euler phase transform of the current tick.
                         let (real, imag) = compute_euler_rotation(phase);
                         let mut continuum = snapshot;
-                        continuum.context_id = si_bridge::ID_SI_1 as u32;
                         continuum.status_snapshot[0] = real as i8 as u8;
                         continuum.status_snapshot[1] = imag as i8 as u8;
                         log_event(&chat_log, continuum);

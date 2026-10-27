@@ -21,7 +21,7 @@ from urllib.error import HTTPError, URLError
 from urllib.parse import urlsplit
 
 from hyperos.terminal_bridge import process_command
-from hyperos.agents import CACTUS_SYSTEM_CONTEXT, DEFAULT_MODEL, MODEL_OPTIONS
+from hyperos.model_profiles import CACTUS_SYSTEM_CONTEXT, DEFAULT_MODEL, MODEL_OPTIONS, active_profile
 from hyperos.repository_changes import RepositoryChangeBroker, RepositoryConflictError
 
 WORKSPACE = Path(__file__).resolve().parents[1]
@@ -190,7 +190,6 @@ SYSTEM = (
     "Jesli brakuje hosta, adresu IP lub protokolu, popros o te dane i zwroc command=null. "
     "Nie masz telemetrii statkow ani urzadzen. Przy braku danych powiedz to wprost.\n\n"
     + CACTUS_SYSTEM_CONTEXT
-    + "\nJesli pytanie dotyczy osobnych modeli agentow, odpowiedz: Nie — wszyscy korzystaja z tej samej instancji cactus-ai."
 )
 
 _EXECUTION_INTENT = re.compile(
@@ -221,28 +220,6 @@ def _requests_execution(prompt):
     return bool(_EXECUTION_INTENT.search(normalized)
                 or _DIRECT_COMMAND.match(normalized)
                 or re.match(r"^\s*ping(?:\s|$)", normalized))
-
-
-def _asks_agent_model_layout(prompt):
-    normalized = prompt.lower().translate(str.maketrans({
-        "ą": "a", "ć": "c", "ę": "e", "ł": "l", "ń": "n",
-        "ó": "o", "ś": "s", "ź": "z", "ż": "z",
-    }))
-    agent = any(name in normalized for name in ("agenc", "alex", "astyria", "aurelius", "si_1"))
-    model_layout = any(word in normalized for word in ("model", "ai", "sztuczn"))
-    separate = any(word in normalized for word in ("osobn", "oddzieln", "wlasn", "niezalezn"))
-    return agent and model_layout and separate
-
-
-def _asks_shared_agent_model(prompt):
-    normalized = prompt.lower().translate(str.maketrans({
-        "ą": "a", "ć": "c", "ę": "e", "ł": "l", "ń": "n",
-        "ó": "o", "ś": "s", "ź": "z", "ż": "z",
-    }))
-    agent = any(name in normalized for name in ("agenc", "alex", "astyria", "aurelius", "si_1"))
-    model_layout = any(word in normalized for word in ("model", "ai", "sztuczn"))
-    relationship = any(word in normalized for word in ("wspoln", "jedn", "razem", "samym"))
-    return agent and model_layout and relationship
 
 
 def _bounded_ping_command(prompt):
@@ -309,7 +286,7 @@ def propose_with_ollama(prompt, model=DEFAULT_MODEL, system=SYSTEM):
     return json.loads(json.loads(raw)["message"]["content"])
 
 
-def gemini_generate(messages, *, json_response=False, max_output_tokens=256):
+def gemini_generate(messages, *, json_response=False, max_output_tokens=2048):
     api_key = gemini_api_key()
     if not api_key:
         raise RuntimeError("Brak GEMINI_API_KEY w pliku .env")
@@ -342,20 +319,11 @@ def gemini_generate(messages, *, json_response=False, max_output_tokens=256):
     )
 
 
-def repo_change_response(agent, mission, files):
-    profile = {
-        "alex": ("Alex", "architekt kognitywny i ekspert od optymalizacji rdzenia"),
-        "astyria": ("Astyria", "pancerz obronny: izolacja Ring-0 i ochrona pamięci"),
-        "aurelius": ("Aurelius", "rejestr chrono i stoicka ciągłość stanu"),
-        "si_1": ("SI_1", "rdzeń obliczeniowy i topologia continuum"),
-    }
-    if agent not in profile:
-        raise ValueError("Nieznany agent")
+def repo_change_response(mission, files):
     if not gemini_api_key():
         raise RuntimeError("Propozycje zmian repozytorium wymagają skonfigurowanego GEMINI_API_KEY.")
-    name, role = profile[agent]
     system = (
-        f"Jesteś {name}, rolą {role}. Przygotowujesz propozycję zmiany plików repozytorium. "
+        "Przygotowujesz propozycję zmiany plików repozytorium. "
         "Zwróć wyłącznie JSON w formacie {\"changes\":[...]}. "
         "Dla edycji użyj {\"path\":\"wybrana/ścieżka\",\"action\":\"modify\","
         "\"replacements\":[{\"old_text\":\"dokładny fragment\",\"new_text\":\"nowy fragment\"}]}. "
@@ -425,6 +393,8 @@ def propose_with_primary_model(prompt, model=DEFAULT_MODEL, system=SYSTEM):
 
 
 def root_available():
+    if os.geteuid() == 0:
+        return True
     result = subprocess.run(
         ["sudo", "-n", "--", "/usr/bin/id", "-u"],
         capture_output=True, timeout=5, check=False,
@@ -433,7 +403,7 @@ def root_available():
 
 
 def execute_command(command, elevated=False):
-    prefix = ["sudo", "-n", "--"] if elevated else []
+    prefix = ["sudo", "-n", "--"] if elevated and os.geteuid() != 0 else []
     process = subprocess.Popen(
         [*prefix, "/usr/bin/timeout", "-k", "5s", "60s",
          "/bin/bash", "-c", command],
@@ -481,14 +451,6 @@ class TerminalBroker:
     def propose(self, prompt, elevated=True):
         if not isinstance(prompt, str) or not prompt.strip() or len(prompt) > 2000:
             raise ValueError("Wpisz od 1 do 2000 znakow")
-        if _asks_agent_model_layout(prompt):
-            return {
-                "reply": "Nie. Alex, Astyria, Aurelius i SI_1 są rolami czatu korzystającymi ze wspólnej instancji modelu cactus-ai; mają osobne prompty i historię rozmowy, ale nie osobne modele.",
-                "command": None,
-                "proposal_id": None,
-                "expires_in": 180,
-                "vector": "".join(map(str, process_command(prompt).bits)),
-            }
         if not self.model_lock.acquire(blocking=False):
             raise ValueError("Ollama przetwarza inne zadanie; sprobuj za chwile")
         try:
@@ -611,6 +573,8 @@ def make_handler(broker, csrf, port, chat_origin=None, repo_broker=None):
                 })
             if self.path == "/api/repo/files":
                 return self.json_response(200, {"files": repo_broker.list_files()})
+            if self.path == "/api/repo/pending":
+                return self.json_response(200, {"proposals": repo_broker.list_pending()})
             if self.path == "/api/root/status":
                 try:
                     available = root_available()
@@ -618,7 +582,7 @@ def make_handler(broker, csrf, port, chat_origin=None, repo_broker=None):
                     available = False
                 return self.json_response(200, {
                     "root_available": available,
-                    "execution_allowed": self.headers.get("Host") in local_hosts,
+                    "execution_allowed": self.valid_host(),
                 })
             if self.path in {"/", "/index.html"}:
                 body = (WORKSPACE / "web/index.html").read_text().replace(
@@ -658,21 +622,15 @@ def make_handler(broker, csrf, port, chat_origin=None, repo_broker=None):
                 data = json.loads(self.rfile.read(length))
                 if not isinstance(data, dict):
                     raise ValueError("Wymagany obiekt JSON")
-                if (self.path == "/api/root/resolve" and data.get("approved") is not False
-                        and (self.headers.get("Host") not in local_hosts or origin not in local_origins)):
-                    return self.json_response(403, {
-                        "code": "local_only", "error": "Wykonanie root dostepne tylko lokalnie",
-                    })
                 if self.path == "/api/ollama/chat":
                     return self.proxy_chat(data)
                 elif self.path == "/api/repo/propose":
                     mission = data.get("mission")
-                    agent = data.get("agent")
                     if not isinstance(mission, str) or not mission.strip() or len(mission) > 2000:
                         raise ValueError("Misja musi zawierać od 1 do 2000 znaków")
                     paths = data.get("paths")
                     original_files = repo_broker.read_files(paths)
-                    changes = repo_change_response(agent, mission.strip(), original_files)
+                    changes = repo_change_response(mission.strip(), original_files)
                     result = repo_broker.propose_changes(original_files, changes)
                 elif self.path == "/api/repo/resolve":
                     result = repo_broker.resolve(data.get("proposal_id"), data.get("approved"))
@@ -706,19 +664,6 @@ def make_handler(broker, csrf, port, chat_origin=None, repo_broker=None):
             data = {**data, "messages": messages}
             if any(message["images"] for message in messages):
                 return self.proxy_ollama_chat(data, "Ollama · Llama Vision")
-            latest_user_message = next(
-                (message["content"] for message in reversed(messages) if message["role"] == "user"),
-                "",
-            )
-            if latest_user_message and (
-                    _asks_agent_model_layout(latest_user_message)
-                    or _asks_shared_agent_model(latest_user_message)):
-                return self.respond_chat_reply(
-                    "Nie. Alex, Astyria, Aurelius i SI_1 są rolami korzystającymi ze wspólnej "
-                    "instancji modelu cactus-ai; mają osobne prompty i historię rozmowy, ale "
-                    "nie osobne modele.",
-                    "Local matcher · Abarkus",
-                )
             provider = None
             if cactus_si_config() is not None:
                 try:
@@ -794,7 +739,7 @@ def make_handler(broker, csrf, port, chat_origin=None, repo_broker=None):
                         }
                         for message in messages
                     ],
-                    "stream": True, "keep_alive": 0,
+                    "stream": True, "keep_alive": active_profile()["keep_alive"],
                     "options": MODEL_OPTIONS.copy(),
                 }).encode(),
                 headers={"Content-Type": "application/json"},

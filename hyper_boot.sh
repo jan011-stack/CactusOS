@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# HyperOS boot — Ollama ECO by default (si_1 resource mission)
+# HyperOS boot — Ollama ECO by default
 set -euo pipefail
 
 OLLAMA_URL="${OLLAMA_URL:-http://127.0.0.1:11434}"

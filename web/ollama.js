@@ -6,25 +6,6 @@ const BASE_PROMPT = 'Jesteś asystentem terminala CactusOS (HyperOS). Rozmawiasz
   + 'więc nigdy nie twierdź, że coś wykonałeś. Polecenia systemowe są przygotowywane oddzielnie i wymagają zatwierdzenia. '
   + 'Nie zmyślaj faktów o systemie i nie ujawniaj tokenów.';
 
-const AGENT_ROLES = {
-  alex: ['Alex', 'architekt kognitywny i ekspert od optymalizacji rdzenia'],
-  astyria: ['Astyria', 'pancerz obronny: izolacja Ring-0 i ochrona pamięci'],
-  aurelius: ['Aurelius', 'rejestr chrono i stoicka ciągłość stanu'],
-  si_1: ['SI_1', 'rdzeń obliczeniowy i topologia continuum'],
-};
-
-/** Splits an optional leading "@agent" from the text and returns the system prompt. */
-function parseCommand(text) {
-  const match = /^@(\w+)\s+([\s\S]*)$/.exec(text.trim());
-  const role = match && AGENT_ROLES[match[1].toLowerCase()];
-  if (!role) return { agent: null, text: text.trim(), system: BASE_PROMPT };
-  return {
-    agent: role[0],
-    text: match[2].trim() || text.trim(),
-    system: `${BASE_PROMPT} Odpowiadasz jako ${role[0]}, rola: ${role[1]}.`,
-  };
-}
-
 function buildMessages(history, system) {
   const now = new Date();
   const zone = Intl.DateTimeFormat().resolvedOptions().timeZone;
@@ -36,18 +17,6 @@ function trimChatHistory(history) {
   if (history.length > MAX_HISTORY_MESSAGES) {
     history.splice(0, history.length - MAX_HISTORY_MESSAGES);
   }
-}
-
-function buildMissionMessages(history, agentKey, mission) {
-  const role = AGENT_ROLES[agentKey];
-  if (!role) throw new RangeError('Nieznany agent misji.');
-  const system = `${BASE_PROMPT} Odpowiadasz jako ${role[0]}, rola: ${role[1]}. `
-    + 'To wspólna misja wysłana niezależnie do każdego agenta. Przygotuj własną analizę i konkretne rekomendacje. '
-    + 'Nie masz narzędzi ani dostępu do powłoki; niczego nie wykonuj i nie twierdź, że misja została wykonana.';
-  return buildMessages([
-    ...history.slice(-(MAX_HISTORY_MESSAGES - 1)),
-    { role: 'user', content: mission },
-  ], system);
 }
 
 function isPingExecutionRequest(text) {
@@ -145,5 +114,5 @@ async function streamChat(messages, onToken, signal, onProvider = () => {}) {
 }
 
 if (typeof module !== 'undefined') {
-  module.exports = { parseCommand, buildMessages, buildMissionMessages, trimChatHistory, isPingExecutionRequest, isCommandExecutionRequest, streamChat, modelStatus, terminalFetch };
+  module.exports = { BASE_PROMPT, buildMessages, trimChatHistory, isPingExecutionRequest, isCommandExecutionRequest, streamChat, modelStatus, terminalFetch };
 }
