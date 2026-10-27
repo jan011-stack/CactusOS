@@ -1,0 +1,28 @@
+[package]
+name = "hyperos-core"
+version = "0.1.0"
+edition = "2021"
+
+[features]
+default = []
+baremetal = []
+
+[lib]
+path = "src/lib.rs"
+
+[[bin]]
+name = "hyperos-kernel"
+path = "src/main.rs"
+required-features = ["baremetal"]
+
+[dependencies]
+sha2 = { version = "0.10", default-features = false }
+
+[dev-dependencies]
+ureq = { version = "2", default-features = false, features = ["json"] }
+
+[profile.release]
+lto = true
+opt-level = 3
+panic = "abort"
+codegen-units = 1
