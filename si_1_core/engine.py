@@ -1,13 +1,13 @@
-"""SI_1 Engine — now driven by Cactus SI.
+"""Cognitive engine — Ollama primary.
 
-Multi-role agents removed. Single agent: Cactus SI.
+Cactus SI removed. Default model: llama3.2:3b (16GB RAM).
 """
 
 from __future__ import annotations
 
 from dataclasses import dataclass, field
 from datetime import datetime
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, Optional
 
 from .agents import AgentRegistry
 from .memory import ConversationMemory
@@ -19,11 +19,11 @@ from .tools import ToolExecutor, ToolProposal, parse_tool_proposals
 @dataclass
 class SI1Config:
     ollama_url: str = "http://127.0.0.1:11434"
-    ollama_model: str = "cactus-ai:latest"
+    ollama_model: str = "llama3.2:3b"
     gemini_model: str = "gemini-2.0-flash"
     max_tokens: int = 1024
     memory_turns: int = 24
-    default_agent: str = "cactus_si"
+    default_agent: str = "cactus_ai"
 
 
 @dataclass
@@ -34,7 +34,7 @@ class SI1Response:
     provider: str
     model: str
     agent: str
-    proposals: List[ToolProposal] = field(default_factory=list)
+    proposals: list = field(default_factory=list)
     nlp: Optional[NLPResult] = None
     ok: bool = True
     error: Optional[str] = None
@@ -55,8 +55,6 @@ class SI1Response:
 
 
 class SI1Engine:
-    """Cognitive core now centered on Cactus SI."""
-
     def __init__(self, config: Optional[SI1Config] = None):
         self.config = config or SI1Config()
         self.nlp = NLPPipeline()
@@ -89,7 +87,7 @@ class SI1Engine:
 
         if not nlp.safe:
             return SI1Response(
-                text="Wykryto niebezpieczny wzorzec w wejściu. Odrzucono.",
+                text="Wykryto niebezpieczny wzorzec. Odrzucono.",
                 intent=nlp.intent,
                 language=nlp.language,
                 provider="none",
@@ -100,9 +98,7 @@ class SI1Engine:
                 error="unsafe_input",
             )
 
-        system = self.nlp.build_system_prompt(nlp.intent, nlp.language, role.name)
-        system = f"{role.system_prompt}\n{system}"
-
+        system = f"{role.system_prompt}\n{self.nlp.build_system_prompt(nlp.intent, nlp.language, role.name)}"
         mem = self._mem(agent_id) if use_memory else ConversationMemory(max_turns=2)
         if use_memory:
             mem.add("user", nlp.text)
@@ -112,17 +108,6 @@ class SI1Engine:
             ChatMessage(role="user", content=nlp.text),
         ]
 
-        if nlp.intent == Intent.COMMAND:
-            messages.append(
-                ChatMessage(
-                    role="system",
-                    content=(
-                        'If a shell command is needed, include a fenced JSON block: '
-                        '`{"command": "...", "rationale": "..."}`. Do not claim you executed it.'
-                    ),
-                )
-            )
-
         result: CompletionResult = self.router.complete(
             messages, prefer=prefer_provider, nlp=nlp, agent_name=role.name
         )
@@ -130,7 +115,7 @@ class SI1Engine:
         if result.ok and use_memory and result.provider not in ("local_nlp", "local_nlp_fallback"):
             mem.add("assistant", result.text)
 
-        proposals = parse_tool_proposals(result.text) if result.ok and result.provider.startswith("ollama") else []
+        proposals = parse_tool_proposals(result.text) if result.ok and result.provider == "ollama" else []
 
         return SI1Response(
             text=result.text if result.ok else (result.error or "provider_error"),
@@ -147,14 +132,13 @@ class SI1Engine:
 
     def status(self) -> Dict[str, Any]:
         return {
-            "engine": "Cactus SI",
-            "version": "1.2.0-CactusSI",
+            "engine": "Cactus AI (Ollama)",
+            "version": "1.3.0-Ollama16GB",
             "operator": "Mateusz Mitek",
             "providers": self.router.health(),
             "agents": self.agents.list_roles(),
-            "memory_turns": self.config.memory_turns,
+            "recommended_model": "llama3.2:3b",
             "timestamp": datetime.now().isoformat(timespec="seconds"),
-            "note": "Multi-role agents and Cactus AI removed; Cactus SI is primary.",
         }
 
     def approve_tool(self, proposal: ToolProposal) -> Dict[str, Any]:
