@@ -1,8 +1,16 @@
 #!/usr/bin/env bash
+# HyperOS boot — Ollama ECO by default (si_1 resource mission)
 set -euo pipefail
 
-OLLAMA_URL="http://127.0.0.1:11434"
+OLLAMA_URL="${OLLAMA_URL:-http://127.0.0.1:11434}"
 OLLAMA_LOG="${TMPDIR:-/tmp}/hyperos-ollama-serve.log"
+export OLLAMA_NUM_PARALLEL="${OLLAMA_NUM_PARALLEL:-1}"
+export OLLAMA_MAX_LOADED_MODELS="${OLLAMA_MAX_LOADED_MODELS:-1}"
+export OLLAMA_KEEP_ALIVE="${OLLAMA_KEEP_ALIVE:-0}"
+export OLLAMA_FLASH_ATTENTION="${OLLAMA_FLASH_ATTENTION:-1}"
+export CACTUS_OLLAMA_PROFILE="${CACTUS_OLLAMA_PROFILE:-eco}"
+SKIP_WARMUP="${HYPEROS_SKIP_WARMUP:-0}"
+USE_LITE="${HYPEROS_OLLAMA_LITE:-0}"
 
 if ! command -v ollama >/dev/null 2>&1; then
     printf '%s\n' "error: ollama is not installed" >&2
@@ -17,7 +25,7 @@ fi
 if ! curl --silent --fail --max-time 1 "$OLLAMA_URL/api/tags" >/dev/null; then
     ollama serve >"$OLLAMA_LOG" 2>&1 &
     OLLAMA_PID=$!
-    printf 'Started Ollama daemon (pid %s); waiting for %s\n' "$OLLAMA_PID" "$OLLAMA_URL"
+    printf 'Started Ollama daemon (pid %s, eco limits); waiting for %s\n' "$OLLAMA_PID" "$OLLAMA_URL"
     ready=0
     for _ in {1..30}; do
         if curl --silent --fail --max-time 1 "$OLLAMA_URL/api/tags" >/dev/null; then
@@ -32,12 +40,24 @@ if ! curl --silent --fail --max-time 1 "$OLLAMA_URL/api/tags" >/dev/null; then
     fi
 fi
 
-if ! ollama list | grep -q '^llama3.2-vision'; then
-    ollama pull llama3.2-vision
+if [[ "$USE_LITE" == "1" ]]; then
+    if ! ollama list 2>/dev/null | grep -q '^cactus-ai-lite'; then
+        ollama pull llama3.2:1b || true
+        ollama create cactus-ai-lite -f Modelfile.lite || true
+    fi
+    MODEL_NAME="cactus-ai-lite"
+else
+    if ! ollama list 2>/dev/null | grep -q '^llama3.2-vision'; then
+        ollama pull llama3.2-vision
+    fi
+    ollama create cactus-ai -f Modelfile 2>/dev/null || true
+    MODEL_NAME="cactus-ai"
 fi
-ollama run llama3.2-vision "Reply with OK." >/dev/null 2>&1 &
-WARMUP_PID=$!
-wait "$WARMUP_PID"
+
+if [[ "$SKIP_WARMUP" != "1" ]]; then
+    # Short warmup; keep_alive 0 so weights unload after
+    ollama run "$MODEL_NAME" "OK" >/dev/null 2>&1 || true
+fi
 
 if ! command -v cargo >/dev/null 2>&1; then
     printf '%s\n' "error: cargo is not installed" >&2

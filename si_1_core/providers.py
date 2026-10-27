@@ -1,13 +1,12 @@
 """LLM provider router: Ollama (local) → Gemini → optional Cactus SI.
 
-All HTTP is optional; missing keys degrade gracefully.
+Respects CACTUS_OLLAMA_PROFILE for low RAM/CPU defaults.
 """
 
 from __future__ import annotations
 
 import json
 import os
-import urllib.error
 import urllib.request
 from dataclasses import dataclass
 from typing import Any, Dict, List, Optional
@@ -15,7 +14,7 @@ from typing import Any, Dict, List, Optional
 
 @dataclass
 class ChatMessage:
-    role: str  # system | user | assistant
+    role: str
     content: str
 
 
@@ -29,19 +28,32 @@ class CompletionResult:
     raw: Optional[Dict[str, Any]] = None
 
 
-class ProviderRouter:
-    """Priority: CACTUS_SI → GEMINI → OLLAMA (local)."""
+def _ollama_options() -> dict:
+    profile = os.environ.get("CACTUS_OLLAMA_PROFILE", "eco").lower()
+    profiles = {
+        "eco": {"num_ctx": 512, "num_batch": 1, "num_thread": 1, "num_predict": 96, "temperature": 0.1},
+        "balanced": {"num_ctx": 1024, "num_batch": 2, "num_thread": 2, "num_predict": 160, "temperature": 0.2},
+        "quality": {"num_ctx": 2048, "num_batch": 4, "num_thread": 4, "num_predict": 256, "temperature": 0.3},
+    }
+    return profiles.get(profile, profiles["eco"]).copy()
 
+
+def _keep_alive():
+    profile = os.environ.get("CACTUS_OLLAMA_PROFILE", "eco").lower()
+    return {"eco": 0, "balanced": "2m", "quality": "5m"}.get(profile, 0)
+
+
+class ProviderRouter:
     def __init__(
         self,
         ollama_url: str = "http://127.0.0.1:11434",
-        ollama_model: str = "cactus-ai:latest",
+        ollama_model: Optional[str] = None,
         gemini_model: str = "gemini-2.0-flash",
         timeout: float = 60.0,
         max_tokens: int = 1024,
     ):
         self.ollama_url = ollama_url.rstrip("/")
-        self.ollama_model = ollama_model
+        self.ollama_model = ollama_model or os.environ.get("CACTUS_OLLAMA_MODEL", "cactus-ai:latest")
         self.gemini_model = gemini_model
         self.timeout = timeout
         self.max_tokens = max_tokens
@@ -63,13 +75,7 @@ class ProviderRouter:
             except Exception as e:
                 last_err = str(e)
                 continue
-        return CompletionResult(
-            text="",
-            provider="none",
-            model="",
-            ok=False,
-            error=last_err or "no_provider_available",
-        )
+        return CompletionResult(text="", provider="none", model="", ok=False, error=last_err or "no_provider_available")
 
     def _order(self, prefer: Optional[str]) -> List[str]:
         default = []
@@ -85,8 +91,7 @@ class ProviderRouter:
     def _post_json(self, url: str, body: dict, headers: Optional[dict] = None) -> dict:
         data = json.dumps(body).encode("utf-8")
         req = urllib.request.Request(
-            url,
-            data=data,
+            url, data=data,
             headers={**(headers or {}), "Content-Type": "application/json"},
             method="POST",
         )
@@ -94,22 +99,20 @@ class ProviderRouter:
             return json.loads(resp.read().decode("utf-8"))
 
     def _ollama(self, messages: List[ChatMessage]) -> CompletionResult:
+        opts = _ollama_options()
+        opts["num_predict"] = min(opts.get("num_predict", 96), self.max_tokens)
         body = {
             "model": self.ollama_model,
             "messages": [{"role": m.role, "content": m.content} for m in messages],
             "stream": False,
-            "options": {
-                "num_predict": self.max_tokens,
-                "num_ctx": 2048,
-                "temperature": 0.7,
-            },
+            "keep_alive": _keep_alive(),
+            "options": opts,
         }
         raw = self._post_json(f"{self.ollama_url}/api/chat", body)
         text = (raw.get("message") or {}).get("content") or ""
         return CompletionResult(text=text, provider="ollama", model=self.ollama_model, ok=True, raw=raw)
 
     def _gemini(self, messages: List[ChatMessage]) -> CompletionResult:
-        # Convert to Gemini contents format
         system_parts = [m.content for m in messages if m.role == "system"]
         contents = []
         for m in messages:
@@ -117,14 +120,12 @@ class ProviderRouter:
                 continue
             role = "user" if m.role == "user" else "model"
             contents.append({"role": role, "parts": [{"text": m.content}]})
-
         body: Dict[str, Any] = {
             "contents": contents,
             "generationConfig": {"maxOutputTokens": self.max_tokens, "temperature": 0.7},
         }
         if system_parts:
             body["systemInstruction"] = {"parts": [{"text": "\n".join(system_parts)}]}
-
         url = (
             f"https://generativelanguage.googleapis.com/v1beta/models/"
             f"{self.gemini_model}:generateContent?key={self.gemini_key}"
@@ -157,6 +158,9 @@ class ProviderRouter:
         return {
             "ollama_url": self.ollama_url,
             "ollama_model": self.ollama_model,
+            "ollama_profile": os.environ.get("CACTUS_OLLAMA_PROFILE", "eco"),
+            "ollama_options": _ollama_options(),
+            "keep_alive": _keep_alive(),
             "gemini_configured": bool(self.gemini_key),
             "cactus_si_configured": bool(self.cactus_url and self.cactus_key),
         }

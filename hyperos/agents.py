@@ -1,20 +1,78 @@
-"""Chat clients for the four HyperOS agent roles."""
+"""Chat clients for the four HyperOS agent roles.
+
+Resource policy (si_1 2026-10-27):
+- Default ECO profile: tiny context, 1 thread, unload after each call (keep_alive=0)
+- BALANCED available via CACTUS_OLLAMA_PROFILE=balanced
+- Shared model instance for all roles — no parallel model loads
+"""
 
 import json
+import os
 import urllib.request
 from dataclasses import dataclass, field
-from typing import Callable
+from typing import Callable, Dict
 
-OLLAMA_CHAT_URL = "http://127.0.0.1:11434/api/chat"
-DEFAULT_MODEL = "cactus-ai"
-MODEL_OPTIONS = {
-    "num_ctx": 512,
-    "num_batch": 1,
-    "num_thread": 1,
-    "num_predict": 96,
-    "temperature": 0.1,
+OLLAMA_CHAT_URL = os.environ.get("OLLAMA_HOST", "http://127.0.0.1:11434").rstrip("/") + "/api/chat"
+DEFAULT_MODEL = os.environ.get("CACTUS_OLLAMA_MODEL", "cactus-ai")
+
+# --- Resource profiles (RAM / CPU) ---
+# ECO: minimal footprint for weak machines / always-on agents
+# BALANCED: slightly more quality without blowing memory
+# QUALITY: only when operator explicitly opts in
+_PROFILES: Dict[str, dict] = {
+    "eco": {
+        "num_ctx": 512,
+        "num_batch": 1,
+        "num_thread": 1,
+        "num_predict": 96,
+        "temperature": 0.1,
+        "keep_alive": 0,       # unload weights after reply → frees RAM
+        "max_history": 8,
+    },
+    "balanced": {
+        "num_ctx": 1024,
+        "num_batch": 2,
+        "num_thread": 2,
+        "num_predict": 160,
+        "temperature": 0.2,
+        "keep_alive": "2m",    # short cache, then free
+        "max_history": 12,
+    },
+    "quality": {
+        "num_ctx": 2048,
+        "num_batch": 4,
+        "num_thread": 4,
+        "num_predict": 256,
+        "temperature": 0.3,
+        "keep_alive": "5m",
+        "max_history": 16,
+    },
 }
-MAX_HISTORY_MESSAGES = 12
+
+
+def _active_profile_name() -> str:
+    name = os.environ.get("CACTUS_OLLAMA_PROFILE", "eco").strip().lower()
+    return name if name in _PROFILES else "eco"
+
+
+def active_profile() -> dict:
+    return _PROFILES[_active_profile_name()].copy()
+
+
+def model_options() -> dict:
+    p = active_profile()
+    return {
+        "num_ctx": p["num_ctx"],
+        "num_batch": p["num_batch"],
+        "num_thread": p["num_thread"],
+        "num_predict": p["num_predict"],
+        "temperature": p["temperature"],
+    }
+
+
+# Backward-compatible names used by tests / web_server
+MODEL_OPTIONS = model_options()
+MAX_HISTORY_MESSAGES = active_profile()["max_history"]
 
 CACTUS_SYSTEM_CONTEXT = """
 Zweryfikowane fakty o środowisku CactusOS:
@@ -26,6 +84,7 @@ Zweryfikowane fakty o środowisku CactusOS:
 - Brak potwierdzonego połączenia telemetrycznego ze statkiem Mateusz_1 lub innymi statkami.
 - Jądro Rust bare-metal nie ma podłączonego bootloadera/platformy i nie jest uruchomionym systemem operacyjnym.
 - Nie deklaruj synchronizacji GitHub, zmian plików, napraw ani wykonania poleceń bez wyniku potwierdzającego daną operację.
+- Profil zasobów Ollama: eco (domyślny) | balanced | quality — zmienna CACTUS_OLLAMA_PROFILE.
 """.strip()
 
 Transport = Callable[[dict], dict]
@@ -75,14 +134,16 @@ class AgentChat:
     history: list = field(default_factory=list)
 
     def say(self, text: str) -> str:
+        prof = active_profile()
+        max_hist = int(prof["max_history"])
         messages = [*self.history, {"role": "user", "content": text}]
-        messages = messages[-(MAX_HISTORY_MESSAGES - 1):]
+        messages = messages[-(max_hist - 1):]
         payload = {
             "model": self.model,
             "stream": False,
-            "keep_alive": 0,
+            "keep_alive": prof["keep_alive"],
             "messages": [{"role": "system", "content": system_prompt(self.profile)}, *messages],
-            "options": MODEL_OPTIONS.copy(),
+            "options": model_options(),
         }
         reply = self.transport(payload)["message"]["content"].strip()
         self.history = [*messages, {"role": "assistant", "content": reply}]
