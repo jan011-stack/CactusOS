@@ -1,6 +1,6 @@
 const rootTerminalState = {
   busy: false, proposal: null, vector: '', reply: '', result: '', error: '',
-  executionAllowed: false, consent: false,
+  executionAllowed: false, rootAvailable: false, consent: false,
 };
 
 const userTerminalState = {
@@ -19,7 +19,7 @@ function rootTerminalPage() {
       <p>Sprawdź dokładne polecenie przed uruchomieniem jako root:</p>
       <pre id="root-approval-command" class="root-text"></pre>
       <p id="root-approval-error" class="root-error" role="status"></p>
-      <label class="root-consent"><input type="checkbox" id="root-approval-consent"> Zatwierdzam dokładnie to polecenie.</label>
+      <label class="root-consent"><input type="checkbox" id="root-approval-consent"> Zatwierdzam dokładnie to polecenie jako root.</label>
       <div class="heading-actions">
         <button id="root-approval-approve" class="button primary" type="button" disabled>Wykonaj jako root</button>
         <button id="root-approval-reject" class="button" type="button">Odrzuć</button>
@@ -94,7 +94,7 @@ async function submitUserCommand(prompt, entry) {
 async function resolveUserProposal(approved) {
   const state = userTerminalState;
   if (state.busy || !state.proposal) return;
-  if (approved && (!state.executionAllowed || !state.consent)) return;
+  if (approved && !state.consent) return;
   const proposal = state.proposal;
   state.busy = true;
   state.error = '';
@@ -158,12 +158,15 @@ function bindRootTerminal() {
       if (!response.ok) throw new Error(`${result.error || 'Błąd serwera'} (HTTP ${response.status})`);
       return result;
     }).then(result => {
-      rootTerminalState.executionAllowed = result.execution_allowed === true && result.root_available === true;
-      status.textContent = rootTerminalState.executionAllowed ? 'ROOT DOSTĘPNY · WYMAGA ZGODY'
-        : 'ROOT NIEDOSTĘPNY · SPRAWDŹ UPRAWNIENIA SERWERA';
+      rootTerminalState.rootAvailable = result.root_available === true;
+      rootTerminalState.executionAllowed = result.execution_allowed === true;
+      status.textContent = rootTerminalState.rootAvailable
+        ? 'ROOT DOSTĘPNY · WYMAGA ZGODY'
+        : 'ROOT NIEDOSTĘPNY (sudo -n) · ZGODA NADAL WYMAGANA';
       updateRootTerminal();
     }).catch(error => {
       rootTerminalState.executionAllowed = false;
+      rootTerminalState.rootAvailable = false;
       rootTerminalState.error = `Nie można sprawdzić uprawnień root: ${error.message}`;
       status.textContent = 'Backend niedostępny';
       updateRootTerminal();
@@ -214,7 +217,8 @@ function updateApprovalNotice() {
     consent.disabled = state.busy;
     const approve = document.querySelector(`#${prefix}-approval-approve`);
     approve.textContent = state.busy ? 'Przetwarzanie…' : scope;
-    approve.disabled = state.busy || !state.executionAllowed || !state.consent;
+    // Consent alone enables the button. Backend enforces actual privileges.
+    approve.disabled = state.busy || !state.consent;
     document.querySelector(`#${prefix}-approval-reject`).disabled = state.busy;
   }
 }
@@ -222,7 +226,7 @@ function updateApprovalNotice() {
 async function resolveRootProposal(approved) {
   const state = rootTerminalState;
   if (state.busy || !state.proposal) return;
-  if (approved && (!state.executionAllowed || !state.consent)) return;
+  if (approved && !state.consent) return;
   const proposal = state.proposal;
   state.busy = true;
   state.error = '';
@@ -235,6 +239,9 @@ async function resolveRootProposal(approved) {
     state.consent = false;
     state.result = result.cancelled ? 'Odrzucono. Niczego nie wykonano.'
       : `${result.output}\nKod wyjścia: ${result.exit_code}${result.truncated ? '\nWyjście ucięte do 64 KiB.' : ''}`;
+    if (!result.cancelled && result.exit_code !== 0 && !state.rootAvailable) {
+      state.error = 'Polecenie wykonane bez pełnych uprawnień root (sudo -n niedostępne). Skonfiguruj NOPASSWD jeśli potrzebujesz root.';
+    }
     events.unshift({time: new Date().toLocaleTimeString('pl-PL'), type: 'ROOT',
       message: approved ? 'Zatwierdzone polecenie zakończone' : 'Propozycja odrzucona',
       code: result.cancelled ? 'CANCEL' : String(result.exit_code)});
