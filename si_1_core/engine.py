@@ -1,6 +1,6 @@
-"""Cognitive engine — Ollama primary.
+"""Cognitive engine — Gemini primary, Ollama fallback.
 
-Cactus SI removed. Default model: llama3.2:3b (16GB RAM).
+Local NLP fallback removed.
 """
 
 from __future__ import annotations
@@ -112,10 +112,10 @@ class SI1Engine:
             messages, prefer=prefer_provider, nlp=nlp, agent_name=role.name
         )
 
-        if result.ok and use_memory and result.provider not in ("local_nlp", "local_nlp_fallback"):
+        if result.ok and use_memory:
             mem.add("assistant", result.text)
 
-        proposals = parse_tool_proposals(result.text) if result.ok and result.provider == "ollama" else []
+        proposals = parse_tool_proposals(result.text) if result.ok else []
 
         return SI1Response(
             text=result.text if result.ok else (result.error or "provider_error"),
@@ -132,12 +132,12 @@ class SI1Engine:
 
     def status(self) -> Dict[str, Any]:
         return {
-            "engine": "Cactus AI (Ollama)",
-            "version": "1.3.0-Ollama16GB",
+            "engine": "Cactus AI",
+            "version": "1.4.0-GeminiPrimary",
             "operator": "Mateusz Mitek",
             "providers": self.router.health(),
             "agents": self.agents.list_roles(),
-            "recommended_model": "llama3.2:3b",
+            "order": "Gemini → Ollama",
             "timestamp": datetime.now().isoformat(timespec="seconds"),
         }
 

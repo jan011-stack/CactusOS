@@ -1,7 +1,6 @@
-"""LLM provider router: Ollama (primary) → Gemini → local NLP.
+"""LLM provider router: Gemini (primary) → Ollama (fallback).
 
-Cactus SI has been removed.
-Optimized for 16GB RAM Codespaces with llama3.2:3b.
+Local NLP fallback removed.
 """
 
 from __future__ import annotations
@@ -12,7 +11,6 @@ import urllib.request
 from dataclasses import dataclass
 from typing import Any, Dict, List, Optional
 
-from .local_nlp import local_reply
 from .nlp import NLPResult
 
 
@@ -47,10 +45,6 @@ def _keep_alive():
     return {"eco": 0, "balanced": "5m", "quality": "10m"}.get(profile, "5m")
 
 
-def is_local_only() -> bool:
-    return os.environ.get("CACTUS_LOCAL_ONLY", "").strip() in ("1", "true", "yes")
-
-
 class ProviderRouter:
     def __init__(
         self,
@@ -74,33 +68,31 @@ class ProviderRouter:
         nlp: Optional[NLPResult] = None,
         agent_name: str = "Cactus AI",
     ) -> CompletionResult:
-        if is_local_only():
-            text = local_reply(nlp, agent_name) if nlp else "[local] NLP-only mode."
-            return CompletionResult(text=text, provider="local_nlp", model="builtin", ok=True)
-
         order = self._order(prefer)
         last_err = None
         for name in order:
             try:
-                if name == "ollama":
-                    return self._ollama(messages)
                 if name == "gemini":
                     return self._gemini(messages)
+                if name == "ollama":
+                    return self._ollama(messages)
             except Exception as e:
                 last_err = str(e)
                 continue
 
-        if nlp:
-            text = local_reply(nlp, agent_name)
-            return CompletionResult(
-                text=text, provider="local_nlp_fallback", model="builtin", ok=True, error=last_err
-            )
-        return CompletionResult(text="", provider="none", model="", ok=False, error=last_err or "no_provider")
+        return CompletionResult(
+            text="",
+            provider="none",
+            model="",
+            ok=False,
+            error=last_err or "no_provider_available",
+        )
 
     def _order(self, prefer: Optional[str]) -> List[str]:
-        default = ["ollama"]
+        default: List[str] = []
         if self.gemini_key:
             default.append("gemini")
+        default.append("ollama")
         if prefer and prefer in default:
             return [prefer] + [x for x in default if x != prefer]
         return default
@@ -157,11 +149,11 @@ class ProviderRouter:
 
     def health(self) -> Dict[str, Any]:
         return {
-            "primary": "ollama",
+            "primary": "gemini" if self.gemini_key else "ollama",
+            "fallback": "ollama",
+            "gemini_configured": bool(self.gemini_key),
+            "gemini_model": self.gemini_model,
             "ollama_model": self.ollama_model,
             "ollama_profile": os.environ.get("CACTUS_OLLAMA_PROFILE", "balanced"),
-            "recommended_for_16gb": "llama3.2:3b",
-            "gemini_configured": bool(self.gemini_key),
-            "local_nlp_available": True,
-            "cactus_si": "removed",
+            "local_nlp_fallback": "removed",
         }
