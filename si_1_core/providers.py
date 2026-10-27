@@ -1,7 +1,7 @@
-"""LLM provider router: Cactus SI (primary) → Gemini → Ollama → local NLP.
+"""LLM provider router: Ollama (primary) → Gemini → local NLP.
 
-Cactus SI is now the preferred generative backend.
-Multi-role agents and Cactus AI (Ollama cactus-ai) have been demoted.
+Cactus SI has been removed.
+Optimized for 16GB RAM Codespaces with llama3.2:3b.
 """
 
 from __future__ import annotations
@@ -33,18 +33,18 @@ class CompletionResult:
 
 
 def _ollama_options() -> dict:
-    profile = os.environ.get("CACTUS_OLLAMA_PROFILE", "eco").lower()
+    profile = os.environ.get("CACTUS_OLLAMA_PROFILE", "balanced").lower()
     profiles = {
         "eco": {"num_ctx": 512, "num_batch": 1, "num_thread": 1, "num_predict": 96, "temperature": 0.1},
-        "balanced": {"num_ctx": 1024, "num_batch": 2, "num_thread": 2, "num_predict": 160, "temperature": 0.2},
-        "quality": {"num_ctx": 2048, "num_batch": 4, "num_thread": 4, "num_predict": 256, "temperature": 0.3},
+        "balanced": {"num_ctx": 2048, "num_batch": 4, "num_thread": 4, "num_predict": 256, "temperature": 0.2},
+        "quality": {"num_ctx": 4096, "num_batch": 8, "num_thread": 6, "num_predict": 512, "temperature": 0.3},
     }
-    return profiles.get(profile, profiles["eco"]).copy()
+    return profiles.get(profile, profiles["balanced"]).copy()
 
 
 def _keep_alive():
-    profile = os.environ.get("CACTUS_OLLAMA_PROFILE", "eco").lower()
-    return {"eco": 0, "balanced": "2m", "quality": "5m"}.get(profile, 0)
+    profile = os.environ.get("CACTUS_OLLAMA_PROFILE", "balanced").lower()
+    return {"eco": 0, "balanced": "5m", "quality": "10m"}.get(profile, "5m")
 
 
 def is_local_only() -> bool:
@@ -57,39 +57,35 @@ class ProviderRouter:
         ollama_url: str = "http://127.0.0.1:11434",
         ollama_model: Optional[str] = None,
         gemini_model: str = "gemini-2.0-flash",
-        timeout: float = 60.0,
+        timeout: float = 120.0,
         max_tokens: int = 1024,
     ):
         self.ollama_url = ollama_url.rstrip("/")
-        self.ollama_model = ollama_model or os.environ.get("CACTUS_OLLAMA_MODEL", "cactus-ai:latest")
+        self.ollama_model = ollama_model or os.environ.get("CACTUS_OLLAMA_MODEL", "llama3.2:3b")
         self.gemini_model = gemini_model
         self.timeout = timeout
         self.max_tokens = max_tokens
         self.gemini_key = os.environ.get("GEMINI_API_KEY", "").strip()
-        self.cactus_url = os.environ.get("CACTUS_SI_API_URL", "https://cactus-si.ai").strip().rstrip("/")
-        self.cactus_key = os.environ.get("CACTUS_SI_API_KEY", "").strip()
 
     def complete(
         self,
         messages: List[ChatMessage],
         prefer: Optional[str] = None,
         nlp: Optional[NLPResult] = None,
-        agent_name: str = "Cactus SI",
+        agent_name: str = "Cactus AI",
     ) -> CompletionResult:
         if is_local_only():
-            text = local_reply(nlp, agent_name) if nlp else "[local] NLP-only mode active."
+            text = local_reply(nlp, agent_name) if nlp else "[local] NLP-only mode."
             return CompletionResult(text=text, provider="local_nlp", model="builtin", ok=True)
 
         order = self._order(prefer)
         last_err = None
         for name in order:
             try:
-                if name == "cactus_si":
-                    return self._cactus_si(messages)
-                if name == "gemini":
-                    return self._gemini(messages)
                 if name == "ollama":
                     return self._ollama(messages)
+                if name == "gemini":
+                    return self._gemini(messages)
             except Exception as e:
                 last_err = str(e)
                 continue
@@ -97,21 +93,14 @@ class ProviderRouter:
         if nlp:
             text = local_reply(nlp, agent_name)
             return CompletionResult(
-                text=text,
-                provider="local_nlp_fallback",
-                model="builtin",
-                ok=True,
-                error=last_err,
+                text=text, provider="local_nlp_fallback", model="builtin", ok=True, error=last_err
             )
-        return CompletionResult(text="", provider="none", model="", ok=False, error=last_err or "no_provider_available")
+        return CompletionResult(text="", provider="none", model="", ok=False, error=last_err or "no_provider")
 
     def _order(self, prefer: Optional[str]) -> List[str]:
-        default = []
-        if self.cactus_url and self.cactus_key:
-            default.append("cactus_si")
+        default = ["ollama"]
         if self.gemini_key:
             default.append("gemini")
-        default.append("ollama")
         if prefer and prefer in default:
             return [prefer] + [x for x in default if x != prefer]
         return default
@@ -128,7 +117,7 @@ class ProviderRouter:
 
     def _ollama(self, messages: List[ChatMessage]) -> CompletionResult:
         opts = _ollama_options()
-        opts["num_predict"] = min(opts.get("num_predict", 96), self.max_tokens)
+        opts["num_predict"] = min(opts.get("num_predict", 256), self.max_tokens)
         body = {
             "model": self.ollama_model,
             "messages": [{"role": m.role, "content": m.content} for m in messages],
@@ -166,32 +155,13 @@ class ProviderRouter:
             text = json.dumps(raw)[:500]
         return CompletionResult(text=text, provider="gemini", model=self.gemini_model, ok=True, raw=raw)
 
-    def _cactus_si(self, messages: List[ChatMessage]) -> CompletionResult:
-        body = {
-            "model": "cactus-si",
-            "messages": [{"role": m.role, "content": m.content} for m in messages],
-            "max_tokens": self.max_tokens,
-        }
-        headers = {"Authorization": f"Bearer {self.cactus_key}"}
-        url = f"{self.cactus_url}/v1/chat/completions"
-        raw = self._post_json(url, body, headers=headers)
-        text = ""
-        try:
-            text = raw["choices"][0]["message"]["content"]
-        except (KeyError, IndexError, TypeError):
-            text = str(raw)[:500]
-        return CompletionResult(text=text, provider="cactus_si", model="cactus-si", ok=True, raw=raw)
-
     def health(self) -> Dict[str, Any]:
         return {
-            "primary": "cactus_si",
-            "cactus_si_url": self.cactus_url,
-            "cactus_si_configured": bool(self.cactus_url and self.cactus_key),
-            "gemini_configured": bool(self.gemini_key),
+            "primary": "ollama",
             "ollama_model": self.ollama_model,
-            "ollama_profile": os.environ.get("CACTUS_OLLAMA_PROFILE", "eco"),
-            "local_only": is_local_only(),
+            "ollama_profile": os.environ.get("CACTUS_OLLAMA_PROFILE", "balanced"),
+            "recommended_for_16gb": "llama3.2:3b",
+            "gemini_configured": bool(self.gemini_key),
             "local_nlp_available": True,
-            "removed_roles": ["si_1", "alex", "astyria", "aurelius"],
-            "removed_models": ["cactus-ai"],
+            "cactus_si": "removed",
         }

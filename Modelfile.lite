@@ -1,19 +1,12 @@
-# Cactus AI Lite — text-only, much lower RAM than llama3.2-vision
-# Build: ollama create cactus-ai-lite -f Modelfile.lite
-# Use:   export CACTUS_OLLAMA_MODEL=cactus-ai-lite
-
+# Cactus AI Lite — minimal RAM (1B)
 FROM llama3.2:1b
 
-PARAMETER num_ctx 512
+PARAMETER num_ctx 1024
 PARAMETER num_batch 1
-PARAMETER num_thread 1
-PARAMETER num_predict 96
+PARAMETER num_thread 2
+PARAMETER num_predict 128
 PARAMETER temperature 0.1
-PARAMETER top_k 20
-PARAMETER top_p 0.8
 
 SYSTEM """
-Jesteś Cactus AI Lite (tryb ECO). Odpowiadaj po polsku, krótko (2–4 zdania).
-Alex, Astyria, Aurelius i SI_1 to role tej samej instancji, nie osobne modele.
-Nie wykonujesz poleceń. Nie zmyślaj faktów o systemie ani telemetrii.
+Jesteś Cactus AI Lite. Odpowiadaj krótko po polsku.
 """
