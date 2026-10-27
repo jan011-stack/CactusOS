@@ -1,15 +1,17 @@
 """Safe tool proposal protocol — never auto-executes.
 
 Matches CactusOS policy: show full command, require explicit WYKONAJ.
+Supports optional elevated (root via sudo -n) after approve=True.
 """
 
 from __future__ import annotations
 
 import json
 import re
-import subprocess
 from dataclasses import dataclass
 from typing import Any, Dict, List, Optional
+
+from .terminal_fix import execute_command as _exec, root_available
 
 
 @dataclass
@@ -17,9 +19,15 @@ class ToolProposal:
     command: str
     rationale: str
     cwd: Optional[str] = None
+    elevated: bool = False  # hyperspace root path
 
     def to_dict(self) -> Dict[str, Any]:
-        return {"command": self.command, "rationale": self.rationale, "cwd": self.cwd}
+        return {
+            "command": self.command,
+            "rationale": self.rationale,
+            "cwd": self.cwd,
+            "elevated": self.elevated,
+        }
 
 
 _PROPOSAL_RE = re.compile(
@@ -36,24 +44,17 @@ def parse_tool_proposals(llm_text: str) -> List[ToolProposal]:
             obj = json.loads(m.group(1))
         except json.JSONDecodeError:
             continue
-        if isinstance(obj, dict) and "command" in obj:
-            out.append(
-                ToolProposal(
-                    command=str(obj["command"]),
-                    rationale=str(obj.get("rationale", "")),
-                    cwd=obj.get("cwd"),
-                )
-            )
-        elif isinstance(obj, list):
-            for item in obj:
-                if isinstance(item, dict) and "command" in item:
-                    out.append(
-                        ToolProposal(
-                            command=str(item["command"]),
-                            rationale=str(item.get("rationale", "")),
-                            cwd=item.get("cwd"),
-                        )
+        items = obj if isinstance(obj, list) else [obj] if isinstance(obj, dict) else []
+        for item in items:
+            if isinstance(item, dict) and "command" in item:
+                out.append(
+                    ToolProposal(
+                        command=str(item["command"]),
+                        rationale=str(item.get("rationale", "")),
+                        cwd=item.get("cwd"),
+                        elevated=bool(item.get("elevated", False)),
                     )
+                )
     return out
 
 
@@ -69,29 +70,15 @@ class ToolExecutor:
             return {
                 "ok": False,
                 "error": "not_approved",
-                "hint": "Pass approve=True only after operator types WYKONAJ",
+                "hint": "Pass approve=True only after operator types WYKONAJ / checks consent",
                 "command": proposal.command,
+                "elevated": proposal.elevated,
+                "root_available": root_available(),
             }
-        cwd = proposal.cwd or self.default_cwd
-        try:
-            proc = subprocess.run(
-                proposal.command,
-                shell=True,
-                cwd=cwd,
-                capture_output=True,
-                text=True,
-                timeout=self.timeout,
-            )
-            stdout = (proc.stdout or "")[:65536]
-            stderr = (proc.stderr or "")[:65536]
-            return {
-                "ok": proc.returncode == 0,
-                "returncode": proc.returncode,
-                "stdout": stdout,
-                "stderr": stderr,
-                "command": proposal.command,
-            }
-        except subprocess.TimeoutExpired:
-            return {"ok": False, "error": "timeout", "command": proposal.command}
-        except Exception as e:
-            return {"ok": False, "error": str(e), "command": proposal.command}
+        result = _exec(
+            proposal.command,
+            elevated=proposal.elevated,
+            approve=True,
+            timeout_sec=self.timeout,
+        )
+        return result.to_dict()
