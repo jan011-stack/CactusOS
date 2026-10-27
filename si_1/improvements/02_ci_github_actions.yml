@@ -1,0 +1,38 @@
+# Proposal: .github/workflows/build.yml
+# (copy into a real fork of CactusOS)
+
+name: Build CactusOS
+
+on:
+  push:
+    branches: [ master, main ]
+  pull_request:
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y build-essential nasm xorriso qemu-system-x86
+
+      - name: Install i686-elf cross compiler
+        run: |
+          # placeholder - use a cached toolchain or build from source
+          echo "Cross-compiler setup required"
+
+      - name: Build ISO
+        run: make CactusOS.iso
+
+      - name: QEMU smoke test
+        run: |
+          timeout 30s qemu-system-i386 -cdrom CactusOS.iso -nographic -serial stdio || true
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: CactusOS-iso
+          path: CactusOS.iso
