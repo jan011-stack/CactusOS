@@ -1,6 +1,8 @@
 """LLM provider router: Ollama (local) → Gemini → optional Cactus SI.
 
 Respects CACTUS_OLLAMA_PROFILE for low RAM/CPU defaults.
+Falls back to pure local NLP when no generative backend is available
+or CACTUS_LOCAL_ONLY=1.
 """
 
 from __future__ import annotations
@@ -10,6 +12,9 @@ import os
 import urllib.request
 from dataclasses import dataclass
 from typing import Any, Dict, List, Optional
+
+from .local_nlp import local_reply
+from .nlp import NLPResult
 
 
 @dataclass
@@ -43,6 +48,10 @@ def _keep_alive():
     return {"eco": 0, "balanced": "2m", "quality": "5m"}.get(profile, 0)
 
 
+def is_local_only() -> bool:
+    return os.environ.get("CACTUS_LOCAL_ONLY", "").strip() in ("1", "true", "yes")
+
+
 class ProviderRouter:
     def __init__(
         self,
@@ -61,7 +70,17 @@ class ProviderRouter:
         self.cactus_url = os.environ.get("CACTUS_SI_API_URL", "").strip().rstrip("/")
         self.cactus_key = os.environ.get("CACTUS_SI_API_KEY", "").strip()
 
-    def complete(self, messages: List[ChatMessage], prefer: Optional[str] = None) -> CompletionResult:
+    def complete(
+        self,
+        messages: List[ChatMessage],
+        prefer: Optional[str] = None,
+        nlp: Optional[NLPResult] = None,
+        agent_name: str = "SI_1",
+    ) -> CompletionResult:
+        if is_local_only():
+            text = local_reply(nlp, agent_name) if nlp else "[local] NLP-only mode active."
+            return CompletionResult(text=text, provider="local_nlp", model="builtin", ok=True)
+
         order = self._order(prefer)
         last_err = None
         for name in order:
@@ -75,6 +94,17 @@ class ProviderRouter:
             except Exception as e:
                 last_err = str(e)
                 continue
+
+        # Generative backends failed — fall back to pure local NLP
+        if nlp:
+            text = local_reply(nlp, agent_name)
+            return CompletionResult(
+                text=text,
+                provider="local_nlp_fallback",
+                model="builtin",
+                ok=True,
+                error=last_err,
+            )
         return CompletionResult(text="", provider="none", model="", ok=False, error=last_err or "no_provider_available")
 
     def _order(self, prefer: Optional[str]) -> List[str]:
@@ -163,4 +193,6 @@ class ProviderRouter:
             "keep_alive": _keep_alive(),
             "gemini_configured": bool(self.gemini_key),
             "cactus_si_configured": bool(self.cactus_url and self.cactus_key),
+            "local_only": is_local_only(),
+            "local_nlp_available": True,
         }

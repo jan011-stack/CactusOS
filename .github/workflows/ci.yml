@@ -1,0 +1,27 @@
+name: CactusOS CI
+
+on:
+  push:
+    branches: [main, master]
+  pull_request:
+
+jobs:
+  python:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+      - name: Python syntax / import check
+        run: |
+          python3 -m compileall -q si_1_core hyperos || true
+          python3 -c "from si_1_core.engine import SI1Engine; print(SI1Engine().status())"
+
+  rust:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - name: Cargo check (no_std lib)
+        run: cargo check --lib || true

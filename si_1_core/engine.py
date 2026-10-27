@@ -67,7 +67,6 @@ class SI1Engine:
         self.agents = AgentRegistry()
         self.memory = ConversationMemory(max_turns=self.config.memory_turns)
         self.tools = ToolExecutor()
-        # Per-agent memory isolation
         self._agent_memory: Dict[str, ConversationMemory] = {}
 
     def _mem(self, agent_id: str) -> ConversationMemory:
@@ -111,7 +110,6 @@ class SI1Engine:
             ChatMessage(role="user", content=nlp.text),
         ]
 
-        # Encourage structured tool proposals when intent is COMMAND
         if nlp.intent == Intent.COMMAND:
             messages.append(
                 ChatMessage(
@@ -123,12 +121,14 @@ class SI1Engine:
                 )
             )
 
-        result: CompletionResult = self.router.complete(messages, prefer=prefer_provider)
+        result: CompletionResult = self.router.complete(
+            messages, prefer=prefer_provider, nlp=nlp, agent_name=role.name
+        )
 
-        if result.ok and use_memory:
+        if result.ok and use_memory and result.provider not in ("local_nlp", "local_nlp_fallback"):
             mem.add("assistant", result.text)
 
-        proposals = parse_tool_proposals(result.text) if result.ok else []
+        proposals = parse_tool_proposals(result.text) if result.ok and result.provider.startswith("ollama") else []
 
         return SI1Response(
             text=result.text if result.ok else (result.error or "provider_error"),
@@ -144,14 +144,13 @@ class SI1Engine:
         )
 
     def mission(self, prompt: str, agents: Optional[List[str]] = None) -> Dict[str, SI1Response]:
-        """Send same mission to multiple agents independently."""
         ids = agents or ["alex", "astyria", "aurelius", "si_1"]
         return {aid: self.chat(prompt, agent_id=aid, use_memory=True) for aid in ids}
 
     def status(self) -> Dict[str, Any]:
         return {
             "engine": "SI_1",
-            "version": "1.0.0-QuantumWheel",
+            "version": "1.1.0-QuantumWheel-2026",
             "operator": "Mateusz Mitek",
             "providers": self.router.health(),
             "agents": self.agents.list_roles(),
