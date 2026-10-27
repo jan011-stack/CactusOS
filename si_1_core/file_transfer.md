@@ -1,26 +1,14 @@
-# Przesyłanie plików w terminalu CactusOS
+# Terminal — załączniki i generowanie obrazów
 
-System może odczytywać pliki z katalogu `uploads/` i generować na ich podstawie.
-
-## Uruchomienie
+Uruchomienie:
 ```bash
 bash scripts/file_transfer.sh
 ```
-Serwer: http://127.0.0.1:8765/ (tylko localhost)
+Adres: http://127.0.0.1:8765/
 
-## Przesyłanie
-**Przeglądarka:** otwórz http://127.0.0.1:8765/ i wybierz plik.
-
-**Terminal (curl):**
+## Wysyłanie plików
 ```bash
 curl -F 'file=@dokument.txt' http://127.0.0.1:8765/upload
-```
-
-**JSON (base64):**
-```bash
-curl -X POST http://127.0.0.1:8765/upload \
-  -H 'Content-Type: application/json' \
-  -d '{"filename":"test.txt","content_b64":"dGVzdA=="}'
 ```
 
 ## Lista plików
@@ -28,11 +16,23 @@ curl -X POST http://127.0.0.1:8765/upload \
 curl http://127.0.0.1:8765/files
 ```
 
-## Użycie przez system
-Pliki lądują w `uploads/`. Silnik / terminal może je czytać:
+## Pobieranie (terminal wysyła załącznik)
 ```bash
-cat uploads/dokument.txt
-python3 -c "print(open('uploads/dokument.txt').read())"
+curl -O http://127.0.0.1:8765/download/dokument.txt
 ```
 
-Limit: 20 MB na plik.
+## Generowanie obrazu
+```bash
+curl -X POST http://127.0.0.1:8765/generate-image \
+  -H 'Content-Type: application/json' \
+  -d '{"prompt":"zielony kaktus na pustyni"}'
+```
+
+Domyślnie generuje SVG (fallback).  
+Aby użyć zewnętrznego API obrazów, ustaw w `.env`:
+```env
+CACTUS_IMAGE_API_URL=https://twoje-api/generate
+CACTUS_IMAGE_API_KEY=opcjonalny_klucz
+```
+
+Wygenerowane pliki lądują w `uploads/generated/`.
