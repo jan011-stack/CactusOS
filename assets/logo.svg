@@ -1,0 +1,14 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 200 200" width="200" height="200">
+  <rect width="200" height="200" fill="#0d1117"/>
+  <g fill="none" stroke="#2ea043" stroke-width="3" stroke-linecap="round">
+    <!-- main stem -->
+    <path d="M100 160 L100 50"/>
+    <!-- arms -->
+    <path d="M100 90 Q70 90 60 60"/>
+    <path d="M100 110 Q130 110 140 80"/>
+    <!-- top -->
+    <path d="M100 50 Q90 30 100 20 Q110 30 100 50"/>
+  </g>
+  <circle cx="100" cy="45" r="4" fill="#3fb950"/>
+  <text x="100" y="185" text-anchor="middle" fill="#8b949e" font-family="system-ui,sans-serif" font-size="12">CactusOS</text>
+</svg>
