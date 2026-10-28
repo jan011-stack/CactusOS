@@ -8,6 +8,7 @@ import time
 import unittest
 from unittest.mock import patch
 from http.server import ThreadingHTTPServer
+from urllib.parse import quote
 from urllib.error import URLError
 from urllib.error import HTTPError
 
@@ -52,6 +53,7 @@ class TerminalBrokerTests(unittest.TestCase):
         proposal = self.broker.propose("jaki mam uid?")
         self.assertEqual(self.executed, [])
         self.assertEqual(len(proposal["vector"]), 256)
+        self.assertEqual(proposal["expires_in"], 600)
         self.assertLessEqual(set(proposal["vector"]), {"0", "1"})
 
     def test_approval_executes_exactly_once(self):
@@ -138,10 +140,12 @@ class TerminalBrokerTests(unittest.TestCase):
             self.assertFalse(_requests_execution(prompt), prompt)
 
     def test_ping_command_is_bounded_and_target_is_validated(self):
-        command = _bounded_ping_command("Kazałem wysłać ping 127.0.0.1")
+        with patch("hyperos.web_server.shutil.which", return_value="/usr/bin/ping"):
+            command = _bounded_ping_command("Kazałem wysłać ping 127.0.0.1")
+            invalid_command = _bounded_ping_command("wyślij ping ; rm -rf /")
         self.assertIsNotNone(command)
         self.assertIn("-c 3 -W 2 127.0.0.1", command)
-        self.assertIsNone(_bounded_ping_command("wyślij ping ; rm -rf /"))
+        self.assertIsNone(invalid_command)
 
     def test_nonstandard_json_text_is_reply_not_executable_command(self):
         broker = TerminalBroker(
@@ -297,7 +301,7 @@ class TerminalBrokerTests(unittest.TestCase):
         fallback.assert_not_called()
         error.close()
 
-    def test_dotenv_loads_only_supported_provider_settings(self):
+    def test_dotenv_loads_supported_model_and_provider_settings(self):
         from pathlib import Path
         from tempfile import TemporaryDirectory
 
@@ -307,6 +311,8 @@ class TerminalBrokerTests(unittest.TestCase):
                 'GEMINI_API_KEY="from-file"\n'
                 'CACTUS_SI_API_URL="https://cactus-si.ai"\n'
                 'CACTUS_SI_API_KEY="test-key"\n'
+                'CACTUS_OLLAMA_MODEL="phi4:14b"\n'
+                'CACTUS_OLLAMA_PROFILE="eco"\n'
                 'OTHER_SECRET=ignored\n'
             )
             with patch.dict("os.environ", {}, clear=True):
@@ -314,6 +320,8 @@ class TerminalBrokerTests(unittest.TestCase):
                 self.assertEqual(os.environ["GEMINI_API_KEY"], "from-file")
                 self.assertEqual(os.environ["CACTUS_SI_API_URL"], "https://cactus-si.ai")
                 self.assertEqual(os.environ["CACTUS_SI_API_KEY"], "test-key")
+                self.assertEqual(os.environ["CACTUS_OLLAMA_MODEL"], "phi4:14b")
+                self.assertEqual(os.environ["CACTUS_OLLAMA_PROFILE"], "eco")
                 self.assertNotIn("OTHER_SECRET", os.environ)
                 os.environ["GEMINI_API_KEY"] = "from-environment"
                 load_dotenv(env_file)
@@ -379,6 +387,34 @@ class TerminalBrokerTests(unittest.TestCase):
             self.assertEqual(response.status, 200)
             response.read()
             self.assertEqual(self.executed_user, ["id -u"])
+        finally:
+            connection.close()
+            server.shutdown()
+            server.server_close()
+            worker.join()
+
+    def test_system_metrics_endpoint_reports_bounded_ram_and_cpu_fields(self):
+        server = ThreadingHTTPServer(("127.0.0.1", 0), http.client.HTTPConnection)
+        port = server.server_port
+        server.RequestHandlerClass = make_handler(self.broker, "test-csrf", port)
+        worker = threading.Thread(target=server.serve_forever, daemon=True)
+        worker.start()
+        connection = http.client.HTTPConnection("127.0.0.1", port, timeout=5)
+        try:
+            connection.request("GET", "/api/system/metrics", headers={"Host": f"localhost:{port}"})
+            response = connection.getresponse()
+            payload = json.loads(response.read())
+            self.assertEqual(response.status, 200)
+            self.assertGreater(payload["memory_total_bytes"], 0)
+            self.assertGreaterEqual(payload["memory_used_bytes"], 0)
+            self.assertLessEqual(payload["memory_used_bytes"], payload["memory_total_bytes"])
+            self.assertGreaterEqual(payload["memory_percent"], 0)
+            self.assertLessEqual(payload["memory_percent"], 100)
+            self.assertIn(payload["memory_scope"], {"host", "kontener"})
+            self.assertIn(payload["cpu_scope"], {"host", "kontener", "niedostępny"})
+            if payload["cpu_percent"] is not None:
+                self.assertGreaterEqual(payload["cpu_percent"], 0)
+                self.assertLessEqual(payload["cpu_percent"], 100)
         finally:
             connection.close()
             server.shutdown()
@@ -523,7 +559,7 @@ class TerminalBrokerTests(unittest.TestCase):
                 self.assertIn(b"Llama reply", response.read())
                 gemini.assert_not_called()
                 forwarded = json.loads(upstream.call_args.args[0].data)
-                self.assertEqual(forwarded["model"], "cactus-ai")
+                self.assertEqual(forwarded["model"], "llama3.2-vision")
                 self.assertEqual(forwarded["messages"][1]["images"], [encoded_image])
         finally:
             connection.close()
@@ -539,12 +575,17 @@ class TerminalBrokerTests(unittest.TestCase):
             root = Path(directory)
             (root / "src").mkdir()
             (root / "src/main.py").write_text("value = 1\n", encoding="utf-8")
+            (root / "assets").mkdir()
+            attachment = root / "assets/payload.bin"
+            attachment.write_bytes(b"\x00attachment\xff")
             (root / ".env").write_text("SECRET=hidden\n", encoding="utf-8")
+            audit_path = root / ".state/downloads.jsonl"
             server = ThreadingHTTPServer(("127.0.0.1", 0), http.client.HTTPConnection)
             port = server.server_port
             server.RequestHandlerClass = make_handler(
                 self.broker, "test-csrf", port,
                 repo_broker=RepositoryChangeBroker(root),
+                download_audit_path=audit_path,
             )
             worker = threading.Thread(target=server.serve_forever, daemon=True)
             worker.start()
@@ -559,7 +600,47 @@ class TerminalBrokerTests(unittest.TestCase):
                 connection.request("GET", "/api/repo/files", headers={"Host": headers["Host"]})
                 response = connection.getresponse()
                 self.assertEqual(response.status, 200)
-                self.assertEqual(json.loads(response.read())["files"], ["src/main.py"])
+                self.assertEqual(json.loads(response.read())["files"], ["assets/payload.bin", "src/main.py"])
+
+                connection.request("GET", "/api/explorer/files", headers={"Host": headers["Host"]})
+                response = connection.getresponse()
+                self.assertEqual(response.status, 200)
+                self.assertEqual(json.loads(response.read())["files"], [
+                    {"path": "assets/payload.bin", "size": attachment.stat().st_size},
+                    {"path": "src/main.py", "size": (root / "src/main.py").stat().st_size},
+                ])
+
+                download_path = f"/api/explorer/download?path={quote('assets/payload.bin')}"
+                connection.request("GET", download_path, headers={"Host": headers["Host"]})
+                response = connection.getresponse()
+                self.assertEqual(response.status, 200)
+                self.assertEqual(response.getheader("Content-Type"), "application/octet-stream")
+                self.assertIn("attachment;", response.getheader("Content-Disposition"))
+                self.assertEqual(response.read(), attachment.read_bytes())
+                connection.request("GET", "/api/explorer/downloads", headers={"Host": headers["Host"]})
+                response = connection.getresponse()
+                self.assertEqual(response.status, 200)
+                audit = json.loads(response.read())
+                downloads = audit["downloads"]
+                self.assertEqual(downloads[-1]["path"], "assets/payload.bin")
+                self.assertEqual(downloads[-1]["outcome"], "response_written")
+                self.assertEqual(downloads[-1]["bytes"], attachment.stat().st_size)
+                self.assertIn("nie potwierdza zapisu pliku", audit["note"])
+                self.assertEqual(audit_path.stat().st_mode & 0o777, 0o600)
+
+                connection.request(
+                    "GET", "/api/explorer/download?path=..%2F.env",
+                    headers={"Host": headers["Host"]},
+                )
+                response = connection.getresponse()
+                self.assertEqual(response.status, 400)
+                response.read()
+                connection.request("GET", "/api/explorer/downloads", headers={"Host": headers["Host"]})
+                response = connection.getresponse()
+                self.assertEqual(response.status, 200)
+                downloads = json.loads(response.read())["downloads"]
+                self.assertEqual(downloads[-1]["outcome"], "rejected")
+                self.assertEqual(downloads[-1]["status"], 400)
 
                 payload = json.dumps({
                     "mission": "Zmień wartość",

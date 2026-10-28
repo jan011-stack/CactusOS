@@ -9,10 +9,10 @@
     <link rel="preconnect" href="https://fonts.googleapis.com">
     <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
     <link href="https://fonts.googleapis.com/css2?family=Fira+Code:wght@300;400;500;600;700&family=Inter:wght@300;400;500;600;700&display=swap" rel="stylesheet">
-    <link rel="stylesheet" href="./styles.css">
-    <script src="./ollama.js" defer></script>
-    <script src="./root_terminal.js" defer></script>
-    <script src="./app.js" defer></script>
+    <link rel="stylesheet" href="./styles.css?v=20261028-terminal-approve-v1">
+    <script src="./ollama.js?v=20261028-terminal-approve-v1" defer></script>
+    <script src="./root_terminal.js?v=20261028-terminal-approve-v1" defer></script>
+    <script src="./app.js?v=20261028-terminal-approve-v1" defer></script>
   </head>
   <body>
     <div class="app-shell">
@@ -27,6 +27,7 @@
         <div class="sidebar-label">OBSZAR ROBOCZY</div>
         <nav class="nav-list">
           <button class="nav-item active" data-page="dashboard"><span class="nav-icon" data-icon="grid"></span><span>Pulpit</span><kbd>01</kbd></button>
+          <button class="nav-item" data-page="explorer"><span class="nav-icon" data-icon="file"></span><span>Pliki</span><kbd>08</kbd></button>
           <button class="nav-item" data-page="repo"><span class="nav-icon" data-icon="file"></span><span>Repozytorium</span><kbd>02</kbd></button>
           <button class="nav-item" data-page="terminal"><span class="nav-icon" data-icon="terminal"></span><span>Terminal</span><kbd>03</kbd></button>
           <button class="nav-item" data-page="hyperspace"><span class="nav-icon" data-icon="shield"></span><span>Hiperterminal</span><kbd>ROOT</kbd></button>
@@ -56,6 +57,29 @@
             <button class="avatar-button" title="Operator Mateusz Mitek">MM</button>
           </div>
         </header>
+        <div id="agent-global-status" class="agent-global-status done" role="status" aria-live="polite"><i aria-hidden="true"></i><strong>READY</strong><span>Terminal gotowy</span></div>
+        <section id="pending-approvals" class="pending-approvals" aria-label="Oczekujące zgody" hidden>
+          <section id="user-approval" class="approval-inline" aria-live="polite" hidden>
+            <strong>Wymagana zgoda · zwykły użytkownik</strong>
+            <p>Sprawdź dokładne polecenie przed uruchomieniem:</p>
+            <pre id="user-approval-command" class="root-text"></pre>
+            <p id="user-approval-error" class="root-error" role="status"></p>
+            <div class="heading-actions">
+              <button id="user-approval-approve" class="button primary" type="button" disabled>Wykonaj</button>
+              <button id="user-approval-reject" class="button" type="button">Odrzuć</button>
+            </div>
+          </section>
+          <section id="root-approval" class="approval-inline" aria-live="polite" hidden>
+            <strong>Wymagana zgoda · uprawnienia root</strong>
+            <p>Sprawdź dokładne polecenie przed uruchomieniem jako root:</p>
+            <pre id="root-approval-command" class="root-text"></pre>
+            <p id="root-approval-error" class="root-error" role="status"></p>
+            <div class="heading-actions">
+              <button id="root-approval-approve" class="button primary" type="button" disabled>Wykonaj jako root</button>
+              <button id="root-approval-reject" class="button" type="button">Odrzuć</button>
+            </div>
+          </section>
+        </section>
 
         <main id="page-content" class="page-content" tabindex="-1"></main>
         <footer class="main-footer"><span>CACTUS CORE <b>·</b> PI GRID 4.0</span><span>TERMINAL: GEMINI / OLLAMA <b>·</b> JĄDRO NIEPODŁĄCZONE</span></footer>

@@ -11,6 +11,7 @@ import time
 
 MAX_SELECTED_FILES = 8
 MAX_FILE_BYTES = 128 * 1024
+MAX_DOWNLOAD_BYTES = 20 * 1024 * 1024
 MAX_CONTEXT_BYTES = 200 * 1024
 MAX_CHANGES = 8
 MAX_PROPOSAL_BYTES = 256 * 1024
@@ -68,6 +69,12 @@ class RepositoryChangeBroker:
         return candidate
 
     def list_files(self):
+        return self._list_files(MAX_FILE_BYTES)
+
+    def list_downloadable_files(self):
+        return self._list_files(MAX_DOWNLOAD_BYTES, include_size=True)
+
+    def _list_files(self, max_file_bytes, *, include_size=False):
         files = []
         for directory, names, filenames in os.walk(self.root, followlinks=False):
             base = Path(directory)
@@ -81,14 +88,51 @@ class RepositoryChangeBroker:
                 relative = path.relative_to(self.root).as_posix()
                 try:
                     _validate_path(relative)
-                    if path.is_symlink() or not path.is_file() or path.stat().st_size > MAX_FILE_BYTES:
+                    if path.is_symlink() or not path.is_file():
+                        continue
+                    size = path.stat().st_size
+                    if size > max_file_bytes:
                         continue
                 except (OSError, ValueError):
                     continue
-                files.append(relative)
+                files.append({"path": relative, "size": size} if include_size else relative)
                 if len(files) >= 1000:
-                    return sorted(files)
-        return sorted(files)
+                    return sorted(files, key=lambda item: item["path"] if include_size else item)
+        return sorted(files, key=lambda item: item["path"] if include_size else item)
+
+    def read_download(self, relative_path):
+        parsed = _validate_path(relative_path)
+        directory_flags = os.O_RDONLY | getattr(os, "O_DIRECTORY", 0) | getattr(os, "O_NOFOLLOW", 0)
+        file_flags = os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0)
+        root_fd = os.open(self.root, directory_flags)
+        current_fd = root_fd
+        file_fd = None
+        try:
+            for part in parsed.parts[:-1]:
+                next_fd = os.open(part, directory_flags, dir_fd=current_fd)
+                if current_fd != root_fd:
+                    os.close(current_fd)
+                current_fd = next_fd
+            file_fd = os.open(parsed.parts[-1], file_flags, dir_fd=current_fd)
+            details = os.fstat(file_fd)
+            if not stat.S_ISREG(details.st_mode):
+                raise ValueError("Można pobierać tylko zwykłe pliki")
+            if details.st_size > MAX_DOWNLOAD_BYTES:
+                raise ValueError("Plik przekracza limit pobierania 20 MiB")
+            with os.fdopen(file_fd, "rb") as stream:
+                file_fd = None
+                content = stream.read(MAX_DOWNLOAD_BYTES + 1)
+            if len(content) > MAX_DOWNLOAD_BYTES:
+                raise ValueError("Plik przekracza limit pobierania 20 MiB")
+            return content
+        except OSError as error:
+            raise ValueError("Plik lub katalog repozytorium nie istnieje albo jest niedostępny") from error
+        finally:
+            if file_fd is not None:
+                os.close(file_fd)
+            if current_fd != root_fd:
+                os.close(current_fd)
+            os.close(root_fd)
 
     def read_files(self, paths):
         if (not isinstance(paths, list) or not 1 <= len(paths) <= MAX_SELECTED_FILES

@@ -30,6 +30,7 @@ const initialEvents = [
 const pageTitles = {
   hyperspace: ['HIPERTERMINAL', 'Terminal binarnej hiperprzestrzeni', 'Kontener Codespaces'],
   dashboard: ['PULPIT', 'Pulpit systemu', 'Stan rdzenia i lokalnych usług w jednym miejscu.'],
+  explorer: ['PLIKI', 'Eksplorator plików', 'Pliki workspace i pobieranie załączników.'],
   repo: ['REPOZYTORIUM', 'Zmiany w repozytorium', 'Propozycje zmian zapisywane wyłącznie po Twojej zgodzie.'],
   terminal: ['TERMINAL', 'Konsola HyperOS', 'Podgląd poleceń i status kolejki terminala.'],
   chronolog: ['CHRONOLOG', 'Strumień zdarzeń', 'Ostatnie wpisy rejestru systemowego.'],
@@ -41,10 +42,74 @@ const pageContent = document.querySelector('#page-content');
 const navButtons = [...document.querySelectorAll('.nav-item')];
 const breadcrumb = document.querySelector('#breadcrumb-current');
 let currentPage = 'dashboard';
-let events = [...initialEvents];
-let commandHistory = [
-  { text: 'Pisz swobodnie: odpowiada skonfigurowany model (Cactus SI, Gemini lub Ollama). clear czyści terminal.', kind: 'notice' },
-];
+const ACTIVITY_STORAGE_KEY = 'cactusos.activity.v1';
+const TERMINAL_HISTORY_STORAGE_KEY = 'cactusos.terminal-history.v1';
+const MAX_TERMINAL_HISTORY_ENTRIES = 40;
+let terminalHistoryError = '';
+
+function loadTerminalHistory() {
+  try {
+    const stored = JSON.parse(localStorage.getItem(TERMINAL_HISTORY_STORAGE_KEY) || '[]');
+    if (!Array.isArray(stored)) throw new Error('Nieprawidłowy format historii');
+    return stored.filter(entry => entry && typeof entry.prompt === 'string'
+      && typeof entry.text === 'string' && ['notice', 'response'].includes(entry.kind)
+      && typeof entry.time === 'string')
+      .slice(-MAX_TERMINAL_HISTORY_ENTRIES)
+      .map(entry => ({
+        prompt: entry.prompt.slice(0, 2000),
+        text: entry.text.slice(0, 12000),
+        kind: entry.kind,
+        time: entry.time.slice(0, 32),
+        provider: typeof entry.provider === 'string' ? entry.provider.slice(0, 80) : '',
+      }));
+  } catch (error) {
+    terminalHistoryError = `Nie udało się odczytać lokalnej historii terminala: ${error.message}`;
+    return [];
+  }
+}
+
+function persistTerminalHistory() {
+  try {
+    localStorage.setItem(TERMINAL_HISTORY_STORAGE_KEY, JSON.stringify(
+      commandHistory.slice(-MAX_TERMINAL_HISTORY_ENTRIES).map(entry => ({
+        prompt: String(entry.prompt || '').slice(0, 2000),
+        text: String(entry.text || '').slice(0, 12000),
+        kind: ['notice', 'response'].includes(entry.kind) ? entry.kind : 'notice',
+        time: String(entry.time || ''),
+        provider: String(entry.provider || '').slice(0, 80),
+      })),
+    ));
+    terminalHistoryError = '';
+  } catch (error) {
+    terminalHistoryError = `Nie udało się zapisać lokalnej historii terminala: ${error.message}`;
+  }
+  const status = pageContent.querySelector('#terminal-history-status');
+  if (status) status.textContent = terminalHistoryError;
+}
+
+function loadEvents() {
+  try {
+    const stored = JSON.parse(localStorage.getItem(ACTIVITY_STORAGE_KEY) || 'null');
+    if (Array.isArray(stored)) {
+      return stored.filter(event => event && ['time', 'type', 'message', 'code']
+        .every(key => typeof event[key] === 'string')).slice(0, 16);
+    }
+  } catch {}
+  return [...initialEvents];
+}
+
+let events = loadEvents();
+
+function recordEvent(event) {
+  events = [event, ...events].slice(0, 16);
+  try {
+    localStorage.setItem(ACTIVITY_STORAGE_KEY, JSON.stringify(events));
+  } catch {}
+  updateDashboardActivityMetric();
+}
+let commandHistory = loadTerminalHistory();
+let agentActivity = [];
+let nextAgentActivityId = 1;
 let chatMessages = [];
 let repoFiles = [];
 let repoFilesLoaded = false;
@@ -58,28 +123,192 @@ let repoQueueError = '';
 let repoQueueTimer = null;
 let repoChangeError = '';
 let repoBusy = false;
+let explorerFiles = [];
+let explorerFilesLoaded = false;
+let explorerFilesLoading = false;
+let explorerFilesAttempted = false;
+let explorerFilesError = '';
+let explorerQuery = '';
+let explorerSelectedPath = '';
 let pendingMediaFiles = [];
 let chatBusy = false;
 let ollamaStatusBusy = false;
 let lastChatProvider = null;
 let toastTimer;
 let clockTimer = null;
+let dashboardMetricsTimer = null;
+let dashboardMetricsBusy = false;
 let terminalUpdateFrame = 0;
 let pendingTerminalEntry = null;
 const MAX_MEDIA_FILE_BYTES = 20 * 1024 * 1024;
 const MAX_MEDIA_IMAGE_BYTES = 1024 * 1024;
 const MAX_MEDIA_TOTAL_BYTES = 3 * 1024 * 1024;
 
-function metricCard(label, value, unit, note, iconName, color) {
-  return `<article class="metric" style="--metric-color:${color}"><div class="metric-head"><span>${label}</span><span class="mini-icon">${icon(iconName, 14)}</span></div><div class="metric-value">${value}<small>${unit}</small></div><div class="metric-foot">${note}</div></article>`;
+function metricCard(label, value, unit, note, iconName, color, key) {
+  return `<article class="metric" style="--metric-color:${color}"><div class="metric-head"><span>${label}</span><span class="mini-icon">${icon(iconName, 14)}</span></div><div class="metric-value"><span id="metric-${key}-value">${value}</span><small id="metric-${key}-unit">${unit}</small></div><div class="metric-foot" id="metric-${key}-note">${note}</div></article>`;
+}
+
+function setMetric(key, value, unit, note) {
+  const valueNode = document.querySelector(`#metric-${key}-value`);
+  const unitNode = document.querySelector(`#metric-${key}-unit`);
+  const noteNode = document.querySelector(`#metric-${key}-note`);
+  if (valueNode) valueNode.textContent = value;
+  if (unitNode) unitNode.textContent = unit;
+  if (noteNode) noteNode.textContent = note;
+}
+
+function addAgentActivity(label, detail, state = 'running') {
+  const step = {
+    id: nextAgentActivityId++,
+    label,
+    detail,
+    state,
+    time: new Date().toLocaleTimeString('pl-PL', { hour12: false }),
+  };
+  agentActivity.unshift(step);
+  agentActivity = agentActivity.slice(0, 12);
+  renderAgentActivity();
+  return step.id;
+}
+
+function updateAgentActivity(id, state, detail, label) {
+  const step = agentActivity.find(item => item.id === id);
+  if (!step) return;
+  step.state = state;
+  step.detail = detail;
+  if (label) step.label = label;
+  step.time = new Date().toLocaleTimeString('pl-PL', { hour12: false });
+  renderAgentActivity();
+}
+
+function renderAgentActivity() {
+  const current = pageContent.querySelector('#agent-current-status');
+  const latest = agentActivity[0];
+  const global = document.querySelector('#agent-global-status');
+  const label = latest?.label || 'Ready';
+  const detail = latest?.detail || 'Terminal gotowy';
+  const state = latest?.state || 'done';
+  if (global) {
+    global.className = `agent-global-status ${escapeHtml(state)}`;
+    global.innerHTML = `<i aria-hidden="true"></i><strong>${escapeHtml(label.toUpperCase())}</strong><span>${escapeHtml(detail)}</span>`;
+  }
+  if (current) {
+    current.className = `agent-current-status ${escapeHtml(state)}`;
+    current.innerHTML = `<i aria-hidden="true"></i><strong>${escapeHtml(label)}</strong><span>${escapeHtml(detail)}</span>`;
+  }
+  const list = pageContent.querySelector('#agent-activity-list');
+  if (!list) return;
+  list.innerHTML = agentActivity.map(step => `<li class="agent-step ${escapeHtml(step.state)}">
+    <span class="agent-step-mark" aria-hidden="true"></span>
+    <div class="agent-step-copy"><strong>${escapeHtml(step.label)}</strong><span>${escapeHtml(step.detail)}</span></div>
+    <time>${escapeHtml(step.time)}</time>
+  </li>`).join('') || '<li class="agent-activity-empty">Brak kroków w tej sesji.</li>';
+}
+
+function agentActivityPanel() {
+  return `<section class="panel agent-activity-panel">
+    <div class="panel-head"><div class="panel-title"><span class="section-icon">${icon('activity')}</span>Przebieg pracy</div><span class="panel-meta">NARZĘDZIA · ZMIANY · WYNIKI</span></div>
+    <ol class="agent-activity-list" id="agent-activity-list" aria-live="polite">${agentActivity.map(step => `<li class="agent-step ${escapeHtml(step.state)}"><span class="agent-step-mark" aria-hidden="true"></span><div class="agent-step-copy"><strong>${escapeHtml(step.label)}</strong><span>${escapeHtml(step.detail)}</span></div><time>${escapeHtml(step.time)}</time></li>`).join('') || '<li class="agent-activity-empty">Brak kroków w tej sesji.</li>'}</ol>
+  </section>`;
+}
+
+function updateDashboardActivityMetric() {
+  setMetric('activity', String(events.length), '/ 16',
+    events[0] ? `OSTATNIE: ${events[0].type} · ${events[0].time}` : 'BRAK ZDARZEŃ');
+  const rows = document.querySelector('#activity-rows');
+  if (rows) rows.innerHTML = eventRows(events.slice(0, 4));
+}
+
+function formatGiB(bytes) {
+  return (bytes / (1024 ** 3)).toFixed(1).replace('.', ',');
 }
 
 function eventRows(list) {
-  return list.map((event) => `<tr><td>${event.time}</td><td><span class="event-mark ${event.type === 'GUARD' ? 'warn' : ''}"><i></i>${event.type}</span></td><td>${escapeHtml(event.message)}</td><td>${event.code}</td></tr>`).join('');
+  return list.map((event) => `<tr><td>${escapeHtml(event.time)}</td><td><span class="event-mark ${event.type === 'GUARD' ? 'warn' : ''}"><i></i>${escapeHtml(event.type)}</span></td><td>${escapeHtml(event.message)}</td><td>${escapeHtml(event.code)}</td></tr>`).join('');
 }
 
 function terminalLines() {
-  return commandHistory.map((entry) => `<div class="terminal-line ${entry.kind}"><span class="time-mark">${entry.time ? `[${entry.time}]` : ''}</span><span class="prompt-mark">${entry.prompt ? '›' : '·'}</span><span class="line-text">${escapeHtml(entry.prompt ? entry.prompt : entry.text)}</span></div>${entry.prompt ? `<div class="terminal-line ${entry.kind}"><span class="time-mark"></span><span class="prompt-mark">↳</span><span class="line-text">${escapeHtml(entry.text)}</span></div>` : ''}`).join('');
+  return commandHistory.map((entry) => `<div class="terminal-line ${entry.kind}"><span class="time-mark">${entry.time ? `[${entry.time}]` : ''}</span><span class="prompt-mark">${entry.prompt ? '›' : '·'}</span><span class="line-text">${escapeHtml(entry.prompt ? entry.prompt : entry.text)}</span></div>${entry.prompt ? `<div class="terminal-line ${entry.kind}"><span class="time-mark"></span><span class="prompt-mark">↳</span><span class="line-text">${entry.provider ? `[${escapeHtml(entry.provider)}] ` : ''}${escapeHtml(entry.text)}</span></div>` : ''}`).join('');
+}
+
+function handleLocalTerminalCommand(command) {
+  const text = command.trim();
+  if (!text) return null;
+  const normalized = text.normalize('NFD').replace(/[\u0300-\u036f]/g, '').toLowerCase();
+
+  if (normalized === 'clear') {
+    return { clearHistory: true };
+  }
+  if (normalized === 'help' || normalized === '?') {
+    return {
+      text: [
+        'Dostępne polecenia lokalne:',
+        '  help, status, models, root, repo, whoami, ls, approve, reject, clear',
+        '  approve / accept / yes zatwierdza jedyną oczekującą propozycję terminala.',
+        '  reject / deny / no odrzuca jedyną oczekującą propozycję terminala.',
+        'Dla bezpiecznego wykonania model przygotowuje propozycję, która wymaga akceptacji.',
+      ].join('\n'),
+      kind: 'notice',
+    };
+  }
+  const approval = terminalApprovalCommand(text);
+  if (approval !== null) {
+    return {
+      text: approval ? 'Zatwierdzam oczekującą propozycję…' : 'Odrzucam oczekującą propozycję…',
+      kind: 'notice',
+      approval,
+    };
+  }
+  if (normalized === 'status') {
+    const provider = lastChatProvider || 'Ollama';
+    const rootState = rootTerminalState.rootAvailable ? 'dostępny' : 'niedostępny';
+    return {
+      text: [
+        'CactusOS · terminal online',
+        `Provider: ${provider}`,
+        `Root: ${rootState}`,
+        'Model lokalny: llama3.1:8b',
+        'Llama Vision: llama3.2-vision',
+      ].join('\n'),
+      kind: 'notice',
+    };
+  }
+  if (normalized === 'models') {
+    return {
+      text: [
+        'Modele dostępne w tej sesji:',
+        '  primary: Gemini (jeśli klucz jest ustawiony)',
+        '  fallback: Ollama · llama3.1:8b',
+        '  vision: Ollama · llama3.2-vision',
+      ].join('\n'),
+      kind: 'notice',
+    };
+  }
+  if (normalized === 'root') {
+    return {
+      text: `Stan wykonawcy root: ${rootTerminalState.rootAvailable ? 'UPRAWNIENIA DOSTĘPNE' : 'UPRAWNIENIA NIEDOSTĘPNE'}; wymagana zgoda przed wykonaniem.`,
+      kind: 'notice',
+    };
+  }
+  if (normalized === 'repo') {
+    return {
+      text: `Repozytorium: ${repoFiles.length ? `${repoFiles.length} plików w kontekście` : 'brak plików w kontekście'}; kolejka: ${repoQueue.length} oczekujących propozycji.`,
+      kind: 'notice',
+    };
+  }
+  if (normalized === 'whoami') {
+    return { text: 'operator@cactus /hyperos/session', kind: 'notice' };
+  }
+  if (normalized === 'ls') {
+    return { text: 'dashboard\nterminal\nhyperspace\nrepo\nchronolog\nmodels\nsettings', kind: 'notice' };
+  }
+  if (normalized === 'pwd') {
+    return { text: '/workspaces/CactusOS', kind: 'notice' };
+  }
+  if (normalized === 'echo') {
+    return { text: 'echo: brak argumentu do wyświetlenia. Użyj: echo "tekst"', kind: 'notice' };
+  }
+  return null;
 }
 
 function terminalPanel() {
@@ -88,7 +317,10 @@ function terminalPanel() {
     <div class="panel-head"><div class="panel-title"><span class="section-icon">${icon('terminal')}</span>Terminal operatora</div><span class="panel-meta">GEMINI · OLLAMA FALLBACK · LLAMA VISION</span></div>
     <div class="panel-body">
       <div class="terminal-toolbar"><i class="window-dot"></i><i class="window-dot"></i><i class="window-dot"></i><span class="terminal-location">/hyperos/session · operator@cactus</span></div>
+      <div class="agent-current-status done" id="agent-current-status" role="status"><i aria-hidden="true"></i><strong>Ready</strong><span>Gotowy na polecenie.</span></div>
       <div class="terminal-output" id="terminal-output" aria-live="polite">${terminalLines()}</div>
+      <p class="terminal-caption">Historia tekstowa (z nazwą dostawcy) jest przechowywana lokalnie w tej przeglądarce (maks. ${MAX_TERMINAL_HISTORY_ENTRIES} wpisów); polecenie clear ją usuwa. Po odświeżeniu nie jest wysyłana ponownie do modelu. Obrazy nie są zapisywane. Model nie ma narzędzi do zakupów ani pobierania z internetu; jego odpowiedź nie potwierdza wykonania czynności.</p>
+      <p id="terminal-history-status" class="root-error" role="status">${escapeHtml(terminalHistoryError)}</p>
       <form class="terminal-composer" id="command-form">
         <span class="composer-prompt">❯</span>
         <input class="terminal-input" id="command-input" maxlength="2000" placeholder="Rozmowa lub polecenie…" autocomplete="off" aria-label="Polecenie terminala" ${commandDisabled ? 'disabled' : ''}>
@@ -96,17 +328,6 @@ function terminalPanel() {
         <input id="attachment-input" type="file" accept="image/*,video/*" multiple hidden>
         <button class="send-button" type="submit" aria-label="Wyślij polecenie" ${commandDisabled ? 'disabled' : ''}>${icon('send', 15)}</button>
       </form>
-      <section id="user-approval" class="approval-inline" aria-live="polite" hidden>
-        <strong>Wymagana zgoda · zwykły użytkownik</strong>
-        <p>Sprawdź dokładne polecenie przed uruchomieniem:</p>
-        <pre id="user-approval-command" class="root-text"></pre>
-        <p id="user-approval-error" class="root-error" role="status"></p>
-        <label class="root-consent"><input type="checkbox" id="user-approval-consent"> Zatwierdzam dokładnie to polecenie.</label>
-        <div class="heading-actions">
-          <button id="user-approval-approve" class="button primary" type="button" disabled>Wykonaj</button>
-          <button id="user-approval-reject" class="button" type="button">Odrzuć</button>
-        </div>
-      </section>
       <div class="attachment-preview" id="attachment-preview">${pendingMediaFiles.map((file, index) => `<span class="attachment-chip">${icon(file.type.startsWith('video/') ? 'image' : 'file', 13)} ${escapeHtml(file.name)}<button type="button" data-remove-attachment="${index}" aria-label="Usuń załącznik ${escapeHtml(file.name)}">×</button></span>`).join('')}</div>
       <div class="terminal-caption">Zwykły tekst obsługuje aktywny dostawca (Gemini/Ollama), a obrazy trafiają lokalnie do Llama Vision przez Ollama. Z wideo analizowane są maksymalnie dwie klatki. Nie wysyłaj sekretów. Polecenia systemowe wymagają zgody i działają jako użytkownik serwera.</div>
       <p id="user-command-error" class="root-error" role="alert"></p>
@@ -115,10 +336,19 @@ function terminalPanel() {
   </section>`;
 }
 
+function safeExecutionPanel() {
+  return `<section class="panel safe-execution-panel">
+    <div class="panel-head"><div class="panel-title"><span class="section-icon">${icon('shield')}</span>Bezpieczne wykonanie</div><span class="panel-meta">USER · APPROVAL REQUIRED</span></div>
+    <div class="panel-body">
+      <p class="runtime-detail">Polecenia wymagające wykonania pojawią się w panelu zgód nad bieżącym widokiem.</p>
+    </div>
+  </section>`;
+}
+
 function dashboardPage() {
   return `<section class="hero"><div class="hero-glow" aria-hidden="true"></div><div class="hero-main"><div class="eyebrow"><i class="live-dot"></i> SYSTEM ONLINE · HYPERSPACE DESKTOP</div><h1>Enter the <span class="gradient-text">Hyperspace</span></h1><p class="hero-copy">Jeden pulpit dla poleceń jądra, i lokalnego modelu. Wybierz moduł albo napisz do terminala swobodnie.</p><div class="heading-actions"><button class="button primary" data-page-link="terminal">${icon('terminal', 14)} Pełny terminal ${icon('arrow', 12)}</button><button class="button" data-page-link="hyperspace">${icon('shield', 14)} Hiperterminal root ${icon('arrow', 12)}</button><button class="button" data-page-link="repo">${icon('file', 14)} Zmiany w repozytorium ${icon('arrow', 12)}</button><button class="button subtle" data-action="refresh">${icon('refresh', 14)} Odśwież widok</button></div></div><div class="hero-chips"><span class="chip ok">JĄDRO: PODGLĄD</span><span class="chip">GEMINI 3.1 FLASH-LITE</span><span class="chip">OLLAMA · FALLBACK</span><span class="chip accent">SPSC</span></div></section>
-    <div class="metric-grid">${metricCard('Pamięć systemu', '30', 'GiB pool', 'STATIC · PODGLĄD', 'memory', '#a9dc72')}${metricCard('ChronoLog', '64', 'sloty', 'RING BUFFER · IDLE', 'activity', '#d6b56f')}${metricCard('Model lokalny', '7.8', 'GB', 'WAGI W CACHE', 'layers', '#95be79')}</div>
-  <div class="dashboard-grid"><div class="stack">${terminalPanel()}<section class="panel"><div class="panel-head"><div class="panel-title"><span class="section-icon">${icon('activity')}</span>Ostatnia aktywność</div><button class="button small subtle" data-page-link="chronolog">Pełny rejestr ${icon('arrow', 12)}</button></div><div class="panel-body" style="padding:0"><table class="activity-table"><thead><tr><th>Czas</th><th>Źródło</th><th>Zdarzenie</th><th>Wynik</th></tr></thead><tbody id="activity-rows">${eventRows(events.slice(0, 4))}</tbody></table></div></section></div><aside class="stack"><section class="panel"><div class="panel-head"><div class="panel-title"><span class="section-icon">${icon('layers')}</span>Runtime modelu</div><span class="panel-meta">OLLAMA</span></div><div class="panel-body"><div class="runtime-row"><span class="runtime-logo">${icon('image', 17)}</span><span><span class="runtime-name">llama3.2-vision</span><span class="runtime-detail">Wagi Q4_K_M zapisane lokalnie. Działa na Ollama 0.6.8 (silnik Go); starsze wersje nie znają architektury mllama.</span><span class="runtime-tag">CACHE READY · INFERENCE OK</span></span></div></div></section><section class="panel"><div class="panel-head"><div class="panel-title"><span class="section-icon">${icon('shield')}</span>Granica bezpieczeństwa</div><span class="panel-meta">RING 0</span></div><div class="panel-body"><div class="status-row" style="padding-top:0;border:0"><span class="status-avatar">${icon('shield', 16)}</span><span class="status-details"><span class="status-name">HyperShield</span><span class="status-role">Prywatny stan jądra · blokada aktywna</span></span><span class="status-status ready"><i></i>LOCKED</span></div></div></section></aside></div>
+    <div class="metric-grid">${metricCard('Pamięć RAM', '—', 'GiB', 'OCZEKIWANIE NA POMIAR', 'memory', '#a9dc72', 'ram')}${metricCard('CPU', '—', '%', 'ZBIERANIE PRÓBKI', 'cpu', '#67e8f9', 'cpu')}${metricCard('Aktywność', String(events.length), '/ 16', 'LOKALNY CHRONOLOG', 'activity', '#d6b56f', 'activity')}${metricCard('Model aktywny', '—', '', 'SPRAWDZANIE STATUSU', 'layers', '#95be79', 'model')}</div>
+  <div class="dashboard-grid"><div class="stack">${terminalPanel()}${agentActivityPanel()}${safeExecutionPanel()}<section class="panel"><div class="panel-head"><div class="panel-title"><span class="section-icon">${icon('activity')}</span>Ostatnia aktywność</div><button class="button small subtle" data-page-link="chronolog">Pełny rejestr ${icon('arrow', 12)}</button></div><div class="panel-body" style="padding:0"><table class="activity-table"><thead><tr><th>Czas</th><th>Źródło</th><th>Zdarzenie</th><th>Wynik</th></tr></thead><tbody id="activity-rows">${eventRows(events.slice(0, 4))}</tbody></table></div></section></div><aside class="stack"><section class="panel"><div class="panel-head"><div class="panel-title"><span class="section-icon">${icon('layers')}</span>Runtime modelu</div><span class="panel-meta">DOSTAWCA</span></div><div class="panel-body"><div class="runtime-row"><span class="runtime-logo">${icon('image', 17)}</span><span><span class="runtime-name" id="dashboard-runtime-model">Sprawdzanie modelu…</span><span class="runtime-detail" id="dashboard-runtime-details">Odczytuję aktualny provider i model.</span><span class="runtime-tag" id="dashboard-runtime-status">POMIAR</span></span></div></div></section><section class="panel"><div class="panel-head"><div class="panel-title"><span class="section-icon">${icon('shield')}</span>Granica bezpieczeństwa</div><span class="panel-meta">RING 0</span></div><div class="panel-body"><div class="status-row" style="padding-top:0;border:0"><span class="status-avatar">${icon('shield', 16)}</span><span class="status-details"><span class="status-name">HyperShield</span><span class="status-role">Prywatny stan jądra · blokada aktywna</span></span><span class="status-status ready"><i></i>LOCKED</span></div></div></section></aside></div>
   <section class="modules"><div class="modules-head"><h2><i class="live-dot"></i> Moduły systemowe</h2><span class="panel-meta">CACTUSOS · NARZĘDZIA HYPEROS</span></div><div class="module-grid">${[
     ['terminal', 'terminal', 'Terminal', 'Rozmowa z modelem lokalnym', '03'],
     ['hyperspace', 'shield', 'Hiperterminal root', 'Polecenia root po lokalnym zatwierdzeniu', 'ROOT'],
@@ -140,11 +370,83 @@ function repoPage() {
   return `<div class="page-heading"><div><div class="eyebrow">GEMINI 3.1 FLASH-LITE · OLLAMA FALLBACK</div><h1>Zmiany w repozytorium</h1><p class="page-subtitle">Model proponuje diff; zapis następuje dopiero po Twojej zgodzie.</p></div></div>
     <section class="panel mission-panel"><div class="panel-head"><div class="panel-title"><span class="section-icon">${icon('file')}</span>Kolejka próśb o akceptację</div><span class="panel-meta" id="repo-queue-count">${repoQueue.length} OCZEKUJE</span><button class="button small subtle" type="button" id="repo-queue-refresh" ${repoQueueLoading ? 'disabled' : ''}>${repoQueueLoading ? 'Sprawdzam…' : 'Odśwież kolejkę'}</button></div><div class="panel-body"><div id="repo-approval-queue">${repoQueueContent}</div></div></section>
     <section class="panel mission-panel"><div class="panel-head"><div class="panel-title"><span class="section-icon">${icon('file')}</span>Przygotuj nową prośbę o zmiany</div><span class="panel-meta">ZAPIS PO TWOJEJ ZGODZIE</span></div><div class="panel-body"><p class="mission-note repo-disclosure">Wybrane pliki zostaną wysłane do Gemini razem z opisem zadania. Model może zaproponować edycję wybranych plików lub utworzenie nowych w istniejących katalogach. Nie ma dostępu do powłoki ani plików sekretów.</p><form id="repo-change-form"><div class="repo-controls"><textarea id="repo-mission" aria-label="Zadanie" maxlength="2000" placeholder="Opisz dokładnie, co ma zostać utworzone lub zmienione…" ${repoBusy ? 'disabled' : ''}></textarea></div><div class="repo-files-head"><strong>Pliki do udostępnienia modelowi</strong><button class="button small subtle" type="button" id="repo-files-refresh" ${repoBusy || repoFilesLoading ? 'disabled' : ''}>${repoFilesLoading ? 'Odświeżanie…' : 'Odśwież listę'}</button></div><div class="repo-file-list" id="repo-file-list">${repoFilesLoaded ? repoFileOptions || '<p class="mission-note">Nie znaleziono dostępnych plików tekstowych.</p>' : repoFilesLoading ? '<p class="mission-note">Wczytuję listę plików…</p>' : '<p class="mission-note">Lista plików jest niedostępna.</p>'}</div>${repoFilesError ? `<p class="repo-error" role="alert">${escapeHtml(repoFilesError)}</p>` : ''}${repoChangeError ? `<p class="repo-error" role="alert">${escapeHtml(repoChangeError)}</p>` : ''}<button class="button primary repo-propose-button" type="submit" ${repoBusy || !repoFilesLoaded ? 'disabled' : ''}>${repoBusy ? 'Przygotowuję…' : 'Przygotuj diff do sprawdzenia'}</button></form></div></section>
-    ${terminalPanel()}`;
+    ${terminalPanel()}${agentActivityPanel()}${safeExecutionPanel()}`;
+}
+
+function formatFileSize(bytes) {
+  if (bytes < 1024) return `${bytes} B`;
+  if (bytes < 1024 * 1024) return `${(bytes / 1024).toFixed(1)} KiB`;
+  return `${(bytes / (1024 * 1024)).toFixed(1)} MiB`;
+}
+
+function explorerRows() {
+  const query = explorerQuery.trim().toLowerCase();
+  const matchingFiles = explorerFiles.filter(file => file.path.toLowerCase().includes(query));
+  if (explorerFilesLoading && !explorerFiles.length) {
+    return '<p class="explorer-empty">Wczytuję pliki workspace…</p>';
+  }
+  if (explorerFilesError) return `<p class="explorer-empty error">${escapeHtml(explorerFilesError)}</p>`;
+  if (!matchingFiles.length) return '<p class="explorer-empty">Brak plików pasujących do wyszukiwania.</p>';
+  return matchingFiles.map(file => `<button class="explorer-file-row ${file.path === explorerSelectedPath ? 'selected' : ''}" type="button" data-explorer-select="${escapeHtml(file.path)}">
+    <span class="explorer-file-icon">${icon('file', 16)}</span><span class="explorer-file-path">${escapeHtml(file.path)}</span><small>${formatFileSize(file.size)}</small>
+  </button>`).join('');
+}
+
+function fileExplorerPage() {
+  const selected = explorerFiles.find(file => file.path === explorerSelectedPath);
+  return `<div class="page-heading"><div><div class="eyebrow"><i class="live-dot"></i> WORKSPACE · PLIKI</div><h1>Eksplorator plików</h1><p class="page-subtitle">Przeglądaj dozwolone pliki workspace i pobieraj załączniki.</p></div></div>
+    <section class="panel explorer-panel">
+      <div class="explorer-toolbar"><label class="explorer-search"><span class="sr-only">Szukaj plików</span><input id="explorer-search" type="search" value="${escapeHtml(explorerQuery)}" placeholder="Szukaj po nazwie lub ścieżce…" autocomplete="off"></label><button class="button subtle" id="explorer-refresh" type="button" ${explorerFilesLoading ? 'disabled' : ''}>${icon('refresh')} Odśwież</button></div>
+      <div class="explorer-layout"><div class="explorer-file-list" id="explorer-file-list" role="list">${explorerRows()}</div>
+        <aside class="explorer-details" aria-live="polite">${selected
+          ? `<span class="explorer-detail-icon">${icon('file', 24)}</span><h2>${escapeHtml(selected.path.split('/').pop())}</h2><p>${escapeHtml(selected.path)}</p><span class="runtime-tag">${formatFileSize(selected.size)}</span><a class="button primary explorer-download" href="/api/explorer/download?path=${encodeURIComponent(selected.path)}" download>${icon('arrow', 14)} Pobierz załącznik</a>`
+          : '<p class="explorer-empty">Wybierz plik, aby zobaczyć szczegóły i go pobrać.</p>'}</aside>
+      </div>
+      <div class="explorer-footer"><span>${explorerFiles.length} plików</span><span>Limit 20 MiB · <a href="/api/explorer/downloads" target="_blank" rel="noopener">dziennik pobrań</a> (odpowiedź serwera, nie potwierdzenie zapisu w przeglądarce)</span></div>
+    </section>`;
+}
+
+async function readFilesApiResponse(response) {
+  const contentType = response.headers.get('content-type') || '';
+  if (!contentType.toLowerCase().includes('application/json')) {
+    throw new Error(
+      `Serwer zwrócił ${contentType || 'nieznany typ danych'} zamiast JSON (HTTP ${response.status}). Sprawdź, czy panel korzysta z backendu HyperOS.`
+    );
+  }
+  let result;
+  try {
+    result = await response.json();
+  } catch {
+    throw new Error(`Serwer zwrócił nieprawidłowy JSON (HTTP ${response.status}).`);
+  }
+  if (!response.ok) throw new Error(result.error || `HTTP ${response.status}`);
+  return result;
+}
+
+async function loadExplorerFiles() {
+  if (explorerFilesLoading) return;
+  explorerFilesAttempted = true;
+  explorerFilesLoading = true;
+  explorerFilesError = '';
+  if (currentPage === 'explorer') renderPage('explorer');
+  try {
+    const response = await fetch('/api/explorer/files', { cache: 'no-store' });
+    const result = await readFilesApiResponse(response);
+    explorerFiles = Array.isArray(result.files) ? result.files : [];
+    explorerFilesLoaded = true;
+    if (!explorerFiles.some(file => file.path === explorerSelectedPath)) {
+      explorerSelectedPath = '';
+    }
+  } catch (error) {
+    explorerFilesError = `Nie udało się wczytać plików: ${error.message}`;
+  } finally {
+    explorerFilesLoading = false;
+    if (currentPage === 'explorer') renderPage('explorer');
+  }
 }
 
 function terminalPage() {
-  return `<div class="page-heading"><div><div class="eyebrow"><i class="live-dot"></i> SHELL · OLLAMA</div><h1>Konsola HyperOS</h1><p class="page-subtitle">Rozmowa z lokalnym modelem lub propozycja polecenia systemowego.</p></div></div>${terminalPanel()}<section class="panel" style="margin-top:14px"><div class="panel-head"><div class="panel-title"><span class="section-icon">${icon('shield')}</span>Bezpieczne wykonanie</div><span class="panel-meta">USER · APPROVAL REQUIRED</span></div><div class="panel-body"><p class="runtime-detail" style="margin:0">Polecenia są wykonywane jako użytkownik serwera dopiero po pokazaniu pełnej treści i jej zatwierdzeniu. Do uprawnień root służy osobny Hiperterminal.</p></div></section>`;
+  return `<div class="page-heading"><div><div class="eyebrow"><i class="live-dot"></i> SHELL · OLLAMA</div><h1>Konsola HyperOS</h1><p class="page-subtitle">Rozmowa z lokalnym modelem lub propozycja polecenia systemowego.</p></div></div>${terminalPanel()}${agentActivityPanel()}${safeExecutionPanel()}`;
 }
 
 function chronologPage() {
@@ -159,7 +461,7 @@ function settingsPage() {
   return `<div class="page-heading"><div><div class="eyebrow"><i class="live-dot"></i> PREFERENCJE</div><h1>Ustawienia panelu</h1><p class="page-subtitle">Lokalne preferencje interfejsu, bez modyfikacji konfiguracji kernela.</p></div></div><div class="content-grid"><section class="panel"><div class="panel-head"><div class="panel-title"><span class="section-icon">${icon('sliders')}</span>Interfejs</div><span class="panel-meta">LOCAL</span></div><div class="panel-body"><div class="setting-row"><div><div class="setting-name">Animacje interfejsu</div><div class="setting-note">Przejścia i delikatne wejście paneli</div></div><button class="toggle on" data-toggle aria-label="Przełącz animacje"></button></div><div class="setting-row"><div><div class="setting-name">Odświeżanie zegara</div><div class="setting-note">Lokalny czas przeglądarki</div></div><button class="toggle on" data-toggle aria-label="Przełącz zegar"></button></div><div class="setting-row"><div><div class="setting-name">Zapis historii demo</div><div class="setting-note">Historia pozostaje tylko w pamięci strony</div></div><button class="toggle" data-toggle aria-label="Przełącz zapis historii"></button></div></div></section><section class="panel"><div class="panel-head"><div class="panel-title"><span class="section-icon">${icon('shield')}</span>O systemie</div></div><div class="panel-body"><div class="setting-row"><span class="setting-name">Build UI</span><span class="log-code">CACTUS-0.1.0</span></div><div class="setting-row"><span class="setting-name">Motyw</span><span class="log-code">BASTILLA / DARK</span></div><div class="setting-row"><span class="setting-name">Połączenie kernel</span><span class="log-level warn">NIEPODŁĄCZONE</span></div></div></section></div>`;
 }
 
-const renderers = { hyperspace: rootTerminalPage, dashboard: dashboardPage, repo: repoPage, terminal: terminalPage, chronolog: chronologPage, models: modelsPage, settings: settingsPage };
+const renderers = { hyperspace: rootTerminalPage, dashboard: dashboardPage, explorer: fileExplorerPage, repo: repoPage, terminal: terminalPage, chronolog: chronologPage, models: modelsPage, settings: settingsPage };
 
 function renderPage(name = currentPage) {
   currentPage = name in renderers ? name : 'dashboard';
@@ -169,9 +471,13 @@ function renderPage(name = currentPage) {
   navButtons.forEach((button) => button.classList.toggle('active', button.dataset.page === currentPage));
   pageContent.innerHTML = renderers[currentPage]();
   bindPageActions();
+  renderAgentActivity();
+  updateDashboardActivityMetric();
+  syncDashboardMetricsTimer();
 }
 
 function bindPageActions() {
+  bindApprovalActions();
   bindRootTerminal();
   bindUserTerminal();
   pageContent.querySelector('#repo-change-form')?.addEventListener('submit', onRepositoryChangeSubmit);
@@ -188,6 +494,21 @@ function bindPageActions() {
     const reject = event.target.closest('[data-repo-reject]');
     if (approve) resolveRepositoryChange(true, approve.dataset.repoApprove);
     if (reject) resolveRepositoryChange(false, reject.dataset.repoReject);
+  });
+  pageContent.querySelector('#explorer-search')?.addEventListener('input', event => {
+    explorerQuery = event.target.value;
+    const list = pageContent.querySelector('#explorer-file-list');
+    if (list) list.innerHTML = explorerRows();
+  });
+  pageContent.querySelector('#explorer-file-list')?.addEventListener('click', event => {
+    const file = event.target.closest('[data-explorer-select]');
+    if (!file) return;
+    explorerSelectedPath = file.dataset.explorerSelect;
+    renderPage('explorer');
+  });
+  pageContent.querySelector('#explorer-refresh')?.addEventListener('click', () => {
+    explorerFilesAttempted = false;
+    loadExplorerFiles();
   });
   pageContent.querySelectorAll('[data-page-link]').forEach((button) => button.addEventListener('click', () => renderPage(button.dataset.pageLink)));
   pageContent.querySelectorAll('[data-action="refresh"]').forEach((button) => button.addEventListener('click', () => { updateClock(); showToast('Widok odświeżony · dane demonstracyjne'); }));
@@ -229,6 +550,10 @@ function bindPageActions() {
   } else if (repoQueueTimer) {
     clearInterval(repoQueueTimer);
     repoQueueTimer = null;
+  }
+  if (currentPage === 'explorer' && !explorerFilesLoaded
+      && !explorerFilesLoading && !explorerFilesAttempted) {
+    loadExplorerFiles();
   }
 }
 
@@ -357,8 +682,7 @@ async function loadRepositoryFiles() {
   if (currentPage === 'repo') renderPage('repo');
   try {
     const response = await fetch('/api/repo/files', { cache: 'no-store' });
-    const result = await response.json();
-    if (!response.ok) throw new Error(result.error || `HTTP ${response.status}`);
+    const result = await readFilesApiResponse(response);
     repoFiles = Array.isArray(result.files) ? result.files : [];
     repoFilesLoaded = true;
     repoSelectedFiles = repoSelectedFiles.filter(path => repoFiles.includes(path));
@@ -437,6 +761,7 @@ async function onRepositoryChangeSubmit(event) {
   repoBusy = true;
   chatBusy = true;
   repoChangeError = '';
+  const activityId = addAgentActivity('Loading', `Analiza prośby · ${repoSelectedFiles.length} pliki kontekstu`);
   renderPage('repo');
   try {
     const response = await terminalFetch('/api/repo/propose', {
@@ -446,8 +771,10 @@ async function onRepositoryChangeSubmit(event) {
     const result = await response.json();
     if (!response.ok) throw new Error(`${result.error || 'Błąd serwera'} (HTTP ${response.status})`);
     repoChangeError = `Dodano do kolejki akceptacji (${result.changes.length} plików).`;
+    updateAgentActivity(activityId, 'waiting', `${result.changes.length} plików · oczekuje na sprawdzenie diffu`, 'Diff gotowy');
   } catch (error) {
     repoChangeError = `Nie udało się przygotować propozycji: ${error.message}`;
+    updateAgentActivity(activityId, 'error', error.message, 'Błąd analizy zmian');
   } finally {
     repoBusy = false;
     chatBusy = false;
@@ -466,6 +793,11 @@ async function resolveRepositoryChange(approved, proposalId) {
   repoBusy = true;
   chatBusy = true;
   repoChangeError = '';
+  const activityId = addAgentActivity(
+    approved ? 'Running' : 'Cancelled',
+    approved ? `Zapisywanie ${proposal.changes.length} plików` : 'Zmiany odrzucone · pliki bez zmian',
+    approved ? 'running' : 'cancelled',
+  );
   renderPage('repo');
   try {
     const response = await terminalFetch('/api/repo/resolve', {
@@ -476,12 +808,15 @@ async function resolveRepositoryChange(approved, proposalId) {
     if (!response.ok) throw new Error(`${result.error || 'Błąd serwera'} (HTTP ${response.status})`);
     if (approved) {
       repoChangeError = `Zapisano pliki: ${result.applied.join(', ')}`;
+      updateAgentActivity(activityId, 'done', result.applied.join(', '), 'Edited');
     } else {
       repoChangeError = 'Propozycja została odrzucona; pliki nie zostały zmienione.';
+      updateAgentActivity(activityId, 'cancelled', 'Propozycja odrzucona · nic nie zapisano', 'Cancelled');
     }
     repoQueue = repoQueue.filter(item => item.proposal_id !== proposalId);
   } catch (error) {
     repoChangeError = `Nie udało się zatwierdzić propozycji: ${error.message}`;
+    updateAgentActivity(activityId, 'error', error.message, 'Błąd zapisu');
     if (responseInvalidatesProposal(error)) {
       repoQueue = repoQueue.filter(item => item.proposal_id !== proposalId);
     }
@@ -506,10 +841,34 @@ async function onCommandSubmit(event) {
   if (!command && !files.length) return;
   input.value = '';
 
-  if (command.toLowerCase() === 'clear' && !files.length) {
-    commandHistory = [];
-    chatMessages = [];
+  const localCommand = handleLocalTerminalCommand(command);
+  if (localCommand && !files.length) {
+    if (localCommand.clearHistory) {
+      commandHistory = [];
+      chatMessages = [];
+      persistTerminalHistory();
+      renderPage(currentPage);
+      return;
+    }
+    const time = new Date().toLocaleTimeString('pl-PL', { hour12: false });
+    const entry = { prompt: command, text: localCommand.text, kind: localCommand.kind || 'notice', time };
+    commandHistory.push(entry);
+    if (commandHistory.length > MAX_TERMINAL_HISTORY_ENTRIES) commandHistory = commandHistory.slice(-MAX_TERMINAL_HISTORY_ENTRIES);
+    persistTerminalHistory();
+    recordEvent({ time, type: 'CLI', message: `Polecenie lokalne · ${command.slice(0, 60)}`, code: 'LOCAL' });
+    addAgentActivity('Done', `Polecenie lokalne · ${command}`, 'done');
     renderPage(currentPage);
+    if (localCommand.approval !== undefined) {
+      await resolvePendingTerminalProposal(localCommand.approval, entry);
+      persistTerminalHistory();
+      updateTerminalOutput(entry);
+    }
+    return;
+  }
+
+  if (userTerminalState.proposal || rootTerminalState.proposal) {
+    input.value = command;
+    showToast('Najpierw zatwierdź lub odrzuć oczekującą propozycję terminala.');
     return;
   }
 
@@ -525,19 +884,23 @@ async function onCommandSubmit(event) {
     const time = new Date().toLocaleTimeString('pl-PL', { hour12: false });
     const entry = { prompt: command, text: 'Przygotowuję propozycję…', kind: 'response', time };
     commandHistory.push(entry);
-    if (commandHistory.length > 18) commandHistory = commandHistory.slice(-18);
-    events.unshift({ time, type: 'CLI', message: `Propozycja polecenia · ${command.slice(0, 60)}`, code: 'USER' });
-    events = events.slice(0, 16);
+    if (commandHistory.length > MAX_TERMINAL_HISTORY_ENTRIES) commandHistory = commandHistory.slice(-MAX_TERMINAL_HISTORY_ENTRIES);
+    persistTerminalHistory();
+    recordEvent({ time, type: 'CLI', message: `Propozycja polecenia · ${command.slice(0, 60)}`, code: 'USER' });
+    const activityId = addAgentActivity('Loading', `Analiza polecenia · ${command}`);
     renderPage(currentPage);
-    submitUserCommand(text, entry);
+    submitUserCommand(text, entry, activityId);
     return;
   }
   const time = new Date().toLocaleTimeString('pl-PL', { hour12: false });
   const entry = { prompt: command || 'Załączniki', text: 'Przygotowuję załączniki…', kind: 'response', time };
   commandHistory.push(entry);
-  if (commandHistory.length > 18) commandHistory = commandHistory.slice(-18);
-  events.unshift({ time, type: 'CLI', message: `Wpis terminala · ${(command || 'załączniki').slice(0, 60)}`, code: 'AI' });
-  events = events.slice(0, 16);
+  if (commandHistory.length > MAX_TERMINAL_HISTORY_ENTRIES) commandHistory = commandHistory.slice(-MAX_TERMINAL_HISTORY_ENTRIES);
+  persistTerminalHistory();
+  recordEvent({ time, type: 'CLI', message: `Wpis terminala · ${(command || 'załączniki').slice(0, 60)}`, code: 'AI' });
+  const activityId = addAgentActivity('Loading', files.length
+    ? `Odczyt załączników · ${files.length} pliki`
+    : 'Łączenie z aktywnym modelem');
 
   pendingMediaFiles = [];
   chatBusy = true;
@@ -548,6 +911,7 @@ async function onCommandSubmit(event) {
     const media = await prepareMediaFiles(files);
     const content = [text || 'Opisz załączone obrazy.', media.labels.length
       ? `Załączniki: ${media.labels.join(', ')}` : ''].filter(Boolean).join('\n\n');
+    updateAgentActivity(activityId, 'running', 'Model generuje odpowiedź', 'Running');
     entry.prompt = `${text || 'Załączniki'}${media.labels.length ? ` [${media.labels.join(', ')}]` : ''}`;
     chatMessages.push({ role: 'user', content, ...(media.images.length ? { images: media.images } : {}) });
     userMessageAdded = true;
@@ -589,8 +953,11 @@ async function onCommandSubmit(event) {
       }
     });
     entry.text = reply || '(model nie zwr\u00f3ci\u0142 odpowiedzi)';
+    entry.provider = lastChatProvider || 'Model';
     chatMessages.push({ role: 'assistant', content: reply });
     trimChatHistory(chatMessages);
+    persistTerminalHistory();
+    updateAgentActivity(activityId, 'done', `${lastChatProvider || 'Model'} · odpowiedź gotowa`, 'Done');
   } catch (error) {
     if (userMessageAdded && chatMessages.at(-1)?.role === 'user') chatMessages.pop();
     if (preparingMedia) pendingMediaFiles = files;
@@ -601,8 +968,11 @@ async function onCommandSubmit(event) {
       : unreachable
       ? 'Nie można połączyć się z serwerem CactusOS. Otwórz stronę na porcie 4180 i sprawdź, czy backend działa.'
       : `Błąd modelu: ${error.message}`;
+    updateAgentActivity(activityId, 'error', error.message,
+      preparingMedia ? 'Błąd przygotowania' : 'Błąd modelu');
   } finally {
     chatBusy = false;
+    persistTerminalHistory();
     renderPage(currentPage);
     pageContent.querySelector('#command-input')?.focus();
     refreshOllamaStatus();
@@ -614,6 +984,7 @@ async function refreshOllamaStatus() {
   ollamaStatusBusy = true;
   try {
     const status = await modelStatus();
+    updateDashboardModelMetric(status);
     const pill = document.querySelector('#ollama-pill');
     if (pill) {
       const online = status?.available === true;
@@ -643,6 +1014,60 @@ function updateClock() {
   if (clock) clock.textContent = new Date().toLocaleTimeString('pl-PL', { hour12: false });
 }
 
+function syncDashboardMetricsTimer() {
+  clearInterval(dashboardMetricsTimer);
+  dashboardMetricsTimer = null;
+  if (currentPage !== 'dashboard' || document.hidden) return;
+  refreshDashboardMetrics();
+  dashboardMetricsTimer = setInterval(refreshDashboardMetrics, 5000);
+}
+
+async function refreshDashboardMetrics() {
+  if (dashboardMetricsBusy || currentPage !== 'dashboard' || document.hidden) return;
+  dashboardMetricsBusy = true;
+  const controller = new AbortController();
+  const timeout = setTimeout(() => controller.abort(), 4000);
+  try {
+    const response = await fetch('/api/system/metrics', {
+      cache: 'no-store', signal: controller.signal,
+    });
+    const metrics = await response.json();
+    if (!response.ok) throw new Error(metrics.error || `HTTP ${response.status}`);
+    const used = formatGiB(metrics.memory_used_bytes);
+    const total = formatGiB(metrics.memory_total_bytes);
+    const available = formatGiB(metrics.memory_available_bytes);
+    setMetric('ram', used, 'GiB',
+      `${metrics.memory_percent}% użyte · ${metrics.memory_scope.toUpperCase()} · ${available} GiB wolne z ${total}`);
+    setMetric('cpu', metrics.cpu_percent === null ? '—' : String(metrics.cpu_percent), '%',
+      metrics.cpu_percent === null
+        ? `ZBIERANIE PRÓBKI · ${metrics.cpu_scope.toUpperCase()}`
+        : `UŻYCIE ${metrics.cpu_scope.toUpperCase()} · ODSWIEŻANIE CO 5 S`);
+  } catch {
+    setMetric('ram', '—', 'GiB', 'POMIAR NIEDOSTĘPNY');
+    setMetric('cpu', '—', '%', 'POMIAR NIEDOSTĘPNY');
+  } finally {
+    clearTimeout(timeout);
+    dashboardMetricsBusy = false;
+  }
+}
+
+function updateDashboardModelMetric(status) {
+  if (!status) {
+    setMetric('model', 'OFFLINE', '', 'STATUS DOSTAWCY NIEDOSTĘPNY');
+  } else {
+    const provider = status.available ? status.primary_provider.toUpperCase() : 'OFFLINE';
+    setMetric('model', provider, '', `${status.primary_model || 'MODEL NIEZNANY'} · ${status.available ? 'ONLINE' : 'BRAK POŁĄCZENIA'}`);
+  }
+  const runtimeName = document.querySelector('#dashboard-runtime-model');
+  const runtimeDetails = document.querySelector('#dashboard-runtime-details');
+  const runtimeStatus = document.querySelector('#dashboard-runtime-status');
+  if (runtimeName) runtimeName.textContent = status?.primary_model || 'Model niedostępny';
+  if (runtimeDetails) runtimeDetails.textContent = status
+    ? `Provider: ${status.primary_provider} · zakres pomiaru: ${status.primary_provider === 'Ollama' ? 'model lokalny' : 'usługa zewnętrzna'}`
+    : 'Nie udało się odczytać statusu modelu.';
+  if (runtimeStatus) runtimeStatus.textContent = status?.available ? 'ONLINE' : 'OFFLINE';
+}
+
 function syncClockTimer() {
   clearInterval(clockTimer);
   clockTimer = null;
@@ -664,6 +1089,11 @@ function showToast(message) {
 }
 
 navButtons.forEach((button) => button.addEventListener('click', () => renderPage(button.dataset.page)));
+window.addEventListener('storage', event => {
+  if (event.key !== ACTIVITY_STORAGE_KEY && event.key !== null) return;
+  events = loadEvents();
+  if (currentPage === 'dashboard' || currentPage === 'chronolog') renderPage(currentPage);
+});
 document.querySelector('#refresh-button').addEventListener('click', () => { updateClock(); showToast('Zegar zsynchronizowany lokalnie'); });
 document.querySelectorAll('[data-icon]').forEach((node) => { node.innerHTML = icon(node.dataset.icon, 16); });
 syncClockTimer();
@@ -672,5 +1102,6 @@ refreshOllamaStatus();
 setInterval(refreshOllamaStatus, 30000);
 document.addEventListener('visibilitychange', () => {
   syncClockTimer();
+  syncDashboardMetricsTimer();
   refreshOllamaStatus();
 });

@@ -9,6 +9,7 @@ export OLLAMA_MAX_LOADED_MODELS="${OLLAMA_MAX_LOADED_MODELS:-1}"
 export OLLAMA_KEEP_ALIVE="${OLLAMA_KEEP_ALIVE:-0}"
 export OLLAMA_FLASH_ATTENTION="${OLLAMA_FLASH_ATTENTION:-1}"
 export CACTUS_OLLAMA_PROFILE="${CACTUS_OLLAMA_PROFILE:-eco}"
+export CACTUS_OLLAMA_MODEL="${CACTUS_OLLAMA_MODEL:-llama3.1:8b}"
 SKIP_WARMUP="${HYPEROS_SKIP_WARMUP:-0}"
 USE_LITE="${HYPEROS_OLLAMA_LITE:-0}"
 
@@ -46,12 +47,12 @@ if [[ "$USE_LITE" == "1" ]]; then
         ollama create cactus-ai-lite -f Modelfile.lite || true
     fi
     MODEL_NAME="cactus-ai-lite"
+    export CACTUS_OLLAMA_MODEL="$MODEL_NAME"
 else
-    if ! ollama list 2>/dev/null | grep -q '^llama3.2-vision'; then
-        ollama pull llama3.2-vision
+    if ! ollama list 2>/dev/null | awk 'NR > 1 {print $1}' | grep -Fxq "$CACTUS_OLLAMA_MODEL"; then
+        ollama pull "$CACTUS_OLLAMA_MODEL"
     fi
-    ollama create cactus-ai -f Modelfile 2>/dev/null || true
-    MODEL_NAME="cactus-ai"
+    MODEL_NAME="$CACTUS_OLLAMA_MODEL"
 fi
 
 if [[ "$SKIP_WARMUP" != "1" ]]; then

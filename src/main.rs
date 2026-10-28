@@ -1,9 +1,13 @@
 #![no_std]
 #![no_main]
 
+#[cfg(feature = "qemu-smoke")]
+mod qemu_platform;
+
 use core::mem::MaybeUninit;
 use core::panic::PanicInfo;
 use core::ptr::NonNull;
+use core::sync::atomic::{AtomicUsize, Ordering};
 use sha2::{Digest, Sha256};
 
 use hyperos_core::chrono_log::{ChronoLogEngine, LogEntry};
@@ -12,34 +16,61 @@ use hyperos_core::hyper_bridge_loop::{HyperBridgeLoop, LoopProgress, NonBlocking
 use hyperos_core::hyper_chrono_guard::HyperChronoGuard;
 use hyperos_core::hyper_diagnostics::run_post_validation;
 use hyperos_core::hyper_euler_engine::compute_euler_rotation;
-use hyperos_core::hyper_ollama_client::{IoError, NonBlockingSocket};
-use hyperos_core::hyper_scheduler::HyperScheduler;
-use hyperos_core::hyper_shield::{HyperShieldController, SecurityRing};
-use hyperos_core::hyper_update_engine::{AuthenticatedUpdateSource, HyperUpdateEngine, UpdateProgress};
-use hyperos_core::hyper_vision::HyperVisionEngine;
+use hyperos_core::hyper_memory_inventory::{parse_memory_map, MAX_MEMORY_MAP_BYTES};
 use hyperos_core::hyper_model::{GgmlType, GgufTensor, TensorInfo};
+use hyperos_core::hyper_ollama_client::{IoError, NonBlockingSocket};
+use hyperos_core::hyper_resource_manager::ResourceRequest;
+use hyperos_core::hyper_scheduler::{HyperScheduler, TASK_SLOTS};
+use hyperos_core::hyper_shield::{HyperShieldController, SecurityRing};
+use hyperos_core::hyper_update_engine::{
+    AuthenticatedUpdateSource, HyperUpdateEngine, UpdateProgress,
+};
+use hyperos_core::hyper_vision::HyperVisionEngine;
+use hyperos_core::kernel::HyperKernel;
 use hyperos_core::sanitized_stream_reader::SanitizedStreamReader;
 use hyperos_core::terminal::{HyperSpaceTerminal, VECTOR_BYTES};
-use hyperos_core::kernel::HyperKernel;
 
+#[cfg(feature = "qemu-smoke")]
+const BLOCK_SIZE: usize = 64 * 1024;
+#[cfg(not(feature = "qemu-smoke"))]
 const BLOCK_SIZE: usize = 8 * 1024 * 1024;
+#[cfg(feature = "qemu-smoke")]
+const POOL_SEGMENTS: usize = 8;
+#[cfg(not(feature = "qemu-smoke"))]
 const POOL_SEGMENTS: usize = 60;
 const ALLOCATOR_BLOCKS: usize = 64;
 const SEGMENT_BYTES: usize = BLOCK_SIZE * ALLOCATOR_BLOCKS;
+#[cfg(feature = "qemu-smoke")]
+const REQUIRED_POOL_BYTES: u64 = (SEGMENT_BYTES * POOL_SEGMENTS) as u64;
+#[cfg(not(feature = "qemu-smoke"))]
 const REQUIRED_POOL_BYTES: u64 = 30 * 1024 * 1024 * 1024;
+#[cfg(feature = "qemu-smoke")]
+const REQUIRED_KV_BYTES: u64 = 16 * 1024 * 1024;
+#[cfg(not(feature = "qemu-smoke"))]
 const REQUIRED_KV_BYTES: u64 = 16 * 1024 * 1024 * 1024;
 const RESPONSE_CAPACITY: usize = 4096;
+const TASK_LOG_CONTEXT_BASE: u32 = 0x4859_0000;
+const RESOURCE_LOG_CONTEXT_BASE: u32 = 0x4859_1000;
+const MEMORY_LOG_CONTEXT_BASE: u32 = 0x4859_2000;
+const CPU_QUANTA_PER_EPOCH: u64 = 64;
+
+#[cfg(feature = "qemu-smoke")]
+core::arch::global_asm!(include_str!("qemu_boot.s"), options(att_syntax));
 
 static mut RESPONSE_BUFFER: [u8; RESPONSE_CAPACITY] = [0; RESPONSE_CAPACITY];
+static INIT_TASK_RUNS: AtomicUsize = AtomicUsize::new(0);
+static RUN_HYPER_TASK_RUNS: AtomicUsize = AtomicUsize::new(0);
 static mut PREBOOT_POOL_BASE: *const u8 = core::ptr::null();
 static mut PREBOOT_POOL_LENGTH: usize = 0;
 static mut PREBOOT_OPERATOR_BASE: *const u8 = core::ptr::null();
 static mut PREBOOT_OPERATOR_LENGTH: usize = 0;
 
-/// All functions below are supplied by the target's bootloader/platform layer.
-/// Input slices remain valid and immutable until the next input poll.
+// All functions below are supplied by the target's bootloader/platform layer.
+// Input slices remain valid and immutable until the next input poll.
 extern "C" {
     fn hyperos_platform_memory_pool(base: *mut *mut u8, length: *mut usize) -> i32;
+    // Returns a bounded buffer of Multiboot-v1-compatible physical memory-map entries.
+    fn hyperos_platform_memory_map(base: *mut *const u8, length: *mut usize) -> i32;
     fn hyperos_platform_illuminate_terminal() -> i32;
     fn hyperos_platform_poll_input(
         prompt: *mut *const u8,
@@ -119,13 +150,44 @@ fn socket_result(result: isize) -> Result<usize, IoError> {
     }
 }
 
-fn idle_task() {}
+fn init_task() {
+    INIT_TASK_RUNS.fetch_add(1, Ordering::Relaxed);
+}
+
+fn run_hyper_task() {
+    RUN_HYPER_TASK_RUNS.fetch_add(1, Ordering::Relaxed);
+}
 
 fn log_event(log: &ChronoLogEngine, entry: LogEntry) {
     if log.push(entry).is_err() {
         let _ = log.pop();
         let _ = log.push(entry);
     }
+}
+
+fn log_task_info(log: &ChronoLogEngine, scheduler: &HyperScheduler, slot: usize, timestamp: u64) {
+    let Some(info) = scheduler.task_info(slot) else {
+        return;
+    };
+    let mut status_snapshot = [0; VECTOR_BYTES];
+    let name = info.name.as_bytes();
+    let name_length = name.len().min(VECTOR_BYTES - 11);
+    status_snapshot[0] = info.pid;
+    status_snapshot[1] = info.slot;
+    status_snapshot[2..6].copy_from_slice(&info.weight.to_le_bytes());
+    status_snapshot[6..10].copy_from_slice(&info.coordinate.to_le_bytes());
+    status_snapshot[10] = name_length as u8;
+    status_snapshot[11..11 + name_length].copy_from_slice(&name[..name_length]);
+    log_event(
+        log,
+        LogEntry {
+            timestamp,
+            context_id: TASK_LOG_CONTEXT_BASE | u32::from(info.pid),
+            status_snapshot,
+        },
+    );
+    #[cfg(feature = "qemu-smoke")]
+    qemu_platform::write_task_line(info.pid, info.name);
 }
 
 pub fn pre_boot_sanity_check() -> bool {
@@ -158,8 +220,36 @@ pub fn pre_boot_sanity_check() -> bool {
     difference == 0
 }
 
+#[cfg(not(feature = "qemu-smoke"))]
 #[no_mangle]
 pub extern "C" fn _start() -> ! {
+    kernel_entry()
+}
+
+#[cfg(feature = "qemu-smoke")]
+#[no_mangle]
+pub extern "C" fn hyperos_kernel_main(magic: u32, info: *const u8) -> ! {
+    if !unsafe { qemu_platform::set_multiboot_info(magic, info) } {
+        panic!("HyperOS: bootloader did not provide a valid Multiboot memory map");
+    }
+    kernel_entry()
+}
+
+fn kernel_entry() -> ! {
+    let mut memory_map_base = core::ptr::null();
+    let mut memory_map_length = 0usize;
+    if unsafe { hyperos_platform_memory_map(&mut memory_map_base, &mut memory_map_length) } != 0
+        || memory_map_base.is_null()
+        || memory_map_length > MAX_MEMORY_MAP_BYTES
+    {
+        panic!("HyperOS: platform did not provide a valid physical memory map");
+    }
+    let memory_map_bytes = unsafe {
+        core::slice::from_raw_parts(memory_map_base, memory_map_length)
+    };
+    let memory_inventory = parse_memory_map(memory_map_bytes)
+        .unwrap_or_else(|_| panic!("HyperOS: physical memory map is malformed"));
+
     let mut pool_base = core::ptr::null_mut();
     let mut pool_length = 0usize;
     if unsafe { hyperos_platform_memory_pool(&mut pool_base, &mut pool_length) } != 0 {
@@ -172,6 +262,9 @@ pub extern "C" fn _start() -> ! {
     };
     if pool_length < required || (pool.as_ptr() as usize) & (BLOCK_SIZE - 1) != 0 {
         panic!("HyperOS: memory pool is undersized or misaligned");
+    }
+    if !memory_inventory.contains_usable_range(pool.as_ptr() as u64, required as u64) {
+        panic!("HyperOS: allocator pool is outside usable physical memory");
     }
 
     let kernel = HyperKernel::new();
@@ -193,6 +286,18 @@ pub extern "C" fn _start() -> ! {
     if unsafe { hyperos_platform_illuminate_terminal() } != 0 {
         panic!("HyperOS: terminal display initialization failed");
     }
+    #[cfg(feature = "qemu-smoke")]
+    {
+        qemu_platform::write_memory_summary(
+            memory_inventory.region_count(),
+            memory_inventory.usable_bytes(),
+            memory_inventory.non_usable_bytes(),
+        );
+        for index in 0..memory_inventory.region_count() {
+            let region = memory_inventory.region(index).unwrap();
+            qemu_platform::write_memory_region(index, region.base, region.length, region.kind);
+        }
+    }
 
     let mut allocators: [MaybeUninit<HyperAllocator<BLOCK_SIZE>>; POOL_SEGMENTS] =
         [const { MaybeUninit::uninit() }; POOL_SEGMENTS];
@@ -213,6 +318,9 @@ pub extern "C" fn _start() -> ! {
     {
         panic!("HyperOS: platform did not provide the aligned 16 GiB KV cache");
     }
+    if !memory_inventory.contains_usable_range(kv_base as u64, kv_length as u64) {
+        panic!("HyperOS: KV cache is outside usable physical memory");
+    }
     let kv_entry_count = kv_length / VECTOR_BYTES;
     let kv_cache: &'static mut [[u8; VECTOR_BYTES]] = unsafe {
         core::slice::from_raw_parts_mut(kv_base.cast(), kv_entry_count)
@@ -220,13 +328,103 @@ pub extern "C" fn _start() -> ! {
 
     let terminal = HyperSpaceTerminal::new();
     let mut scheduler = HyperScheduler::new();
-    if scheduler.register(0, idle_task).is_err() {
+    if scheduler.register_named(0, "INIT", init_task).is_err()
+        || scheduler
+            .register_named(1, "RUN_HYPER", run_hyper_task)
+            .is_err()
+    {
         panic!("HyperOS: scheduler initialization failed");
     }
-    let mut shield = HyperShieldController::new();
+
+    let chat_log = ChronoLogEngine::new();
+    let mut memory_summary = [0; VECTOR_BYTES];
+    memory_summary[0..8].copy_from_slice(&memory_inventory.usable_bytes().to_le_bytes());
+    memory_summary[8..16].copy_from_slice(&memory_inventory.non_usable_bytes().to_le_bytes());
+    memory_summary[16..20]
+        .copy_from_slice(&(memory_inventory.region_count() as u32).to_le_bytes());
+    log_event(
+        &chat_log,
+        LogEntry {
+            timestamp: unsafe { hyperos_clock_ticks() },
+            context_id: MEMORY_LOG_CONTEXT_BASE,
+            status_snapshot: memory_summary,
+        },
+    );
+    for index in 0..memory_inventory.region_count() {
+        let region = memory_inventory.region(index).unwrap();
+        let mut status_snapshot = [0; VECTOR_BYTES];
+        status_snapshot[0..8].copy_from_slice(&region.base.to_le_bytes());
+        status_snapshot[8..16].copy_from_slice(&region.length.to_le_bytes());
+        status_snapshot[16..20].copy_from_slice(&region.kind.to_le_bytes());
+        status_snapshot[20..24].copy_from_slice(&(index as u32).to_le_bytes());
+        log_event(
+            &chat_log,
+            LogEntry {
+                timestamp: unsafe { hyperos_clock_ticks() },
+                context_id: MEMORY_LOG_CONTEXT_BASE | (index as u32 + 1),
+                status_snapshot,
+            },
+        );
+    }
+    let memory_budget = (POOL_SEGMENTS * ALLOCATOR_BLOCKS) as u64;
+    let inactive_request = ResourceRequest {
+        minimum: 0,
+        demand: 0,
+        maximum: 0,
+    };
+    let mut resource_requests = [inactive_request; TASK_SLOTS];
+    for (slot, request) in resource_requests.iter_mut().enumerate() {
+        if scheduler.task_info(slot).is_some() {
+            *request = ResourceRequest {
+                minimum: 0,
+                demand: 0,
+                maximum: memory_budget.max(CPU_QUANTA_PER_EPOCH),
+            };
+        }
+    }
+    let mut memory_quotas = [0u64; TASK_SLOTS];
+    let memory_plan = scheduler
+        .resource_quotas(&resource_requests, memory_budget, 0, &mut memory_quotas)
+        .unwrap_or_else(|_| panic!("HyperOS: memory quota calculation failed"));
+    let mut cpu_quotas = [0u64; TASK_SLOTS];
+    let cpu_plan = scheduler
+        .resource_quotas(
+            &resource_requests,
+            CPU_QUANTA_PER_EPOCH,
+            0,
+            &mut cpu_quotas,
+        )
+        .unwrap_or_else(|_| panic!("HyperOS: CPU quota calculation failed"));
+    for slot in 0..TASK_SLOTS {
+        let Some(info) = scheduler.task_info(slot) else {
+            continue;
+        };
+        let mut status_snapshot = [0; VECTOR_BYTES];
+        status_snapshot[0] = info.pid;
+        status_snapshot[1..9].copy_from_slice(&(memory_quotas[slot] * BLOCK_SIZE as u64).to_le_bytes());
+        status_snapshot[9..17].copy_from_slice(&cpu_quotas[slot].to_le_bytes());
+        log_event(
+            &chat_log,
+            LogEntry {
+                timestamp: unsafe { hyperos_clock_ticks() },
+                context_id: RESOURCE_LOG_CONTEXT_BASE | u32::from(info.pid),
+                status_snapshot,
+            },
+        );
+        #[cfg(feature = "qemu-smoke")]
+        qemu_platform::write_resource_line(
+            info.pid,
+            memory_quotas[slot] * BLOCK_SIZE as u64,
+            cpu_quotas[slot],
+        );
+    }
+    if memory_plan.unused != 0 || cpu_plan.unused != 0 {
+        panic!("HyperOS: resource quota plan left budget unused");
+    }
+
+    let shield = HyperShieldController::new();
     let mut update_engine = HyperUpdateEngine::new();
     let mut update_guard = HyperChronoGuard::new();
-    let mut chat_log = ChronoLogEngine::new();
     let vision_engine = HyperVisionEngine::new();
     let mut request_loop = HyperBridgeLoop::new();
 
@@ -248,12 +446,26 @@ pub extern "C" fn _start() -> ! {
     };
     let mut request_active = false;
     let mut kv_cursor = 0usize;
+    let mut init_task_logged = false;
+    let mut run_hyper_task_logged = false;
 
     loop {
         let ticks = unsafe { hyperos_clock_ticks() };
 
         let phase = (ticks & 7) as f64;
         let _ = scheduler.run_slice(phase);
+        if !init_task_logged && INIT_TASK_RUNS.load(Ordering::Relaxed) != 0 {
+            log_task_info(&chat_log, &scheduler, 0, ticks);
+            init_task_logged = true;
+        }
+        if !run_hyper_task_logged && RUN_HYPER_TASK_RUNS.load(Ordering::Relaxed) != 0 {
+            log_task_info(&chat_log, &scheduler, 1, ticks);
+            run_hyper_task_logged = true;
+        }
+        #[cfg(feature = "qemu-smoke")]
+        if init_task_logged && run_hyper_task_logged {
+            qemu_platform::exit_success();
+        }
 
         match update_engine.poll(
             &mut update_socket,

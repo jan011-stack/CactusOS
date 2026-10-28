@@ -6,6 +6,7 @@ edition = "2021"
 [features]
 default = []
 baremetal = []
+qemu-smoke = ["baremetal"]
 
 [lib]
 path = "src/lib.rs"

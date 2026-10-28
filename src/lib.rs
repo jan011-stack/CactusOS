@@ -8,6 +8,8 @@ pub mod hyper_model;
 pub mod hyper_vision;
 pub mod hyper_allocator;
 pub mod hyper_scheduler;
+pub mod hyper_resource_manager;
+pub mod hyper_memory_inventory;
 pub mod hyper_shield;
 pub mod chrono_log;
 pub mod hyperspace_io;

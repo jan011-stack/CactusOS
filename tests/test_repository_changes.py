@@ -2,7 +2,11 @@ from pathlib import Path
 import tempfile
 import unittest
 
-from hyperos.repository_changes import RepositoryChangeBroker, RepositoryConflictError
+from hyperos.repository_changes import (
+    MAX_DOWNLOAD_BYTES,
+    RepositoryChangeBroker,
+    RepositoryConflictError,
+)
 
 
 class RepositoryChangeBrokerTests(unittest.TestCase):
@@ -23,6 +27,31 @@ class RepositoryChangeBrokerTests(unittest.TestCase):
             self.broker.read_files(["../.env"])
         with self.assertRaisesRegex(ValueError, "Ścieżka poza"):
             self.broker.read_files([".env"])
+
+    def test_download_listing_includes_bounded_binary_files_and_reads_bytes(self):
+        assets = self.root / "assets"
+        assets.mkdir()
+        attachment = assets / "picture.bin"
+        attachment.write_bytes(b"\x00\x01attachment\xff")
+        too_large = assets / "too-large.bin"
+        with too_large.open("wb") as stream:
+            stream.seek(MAX_DOWNLOAD_BYTES)
+            stream.write(b"x")
+
+        self.assertEqual(self.broker.read_download("assets/picture.bin"), attachment.read_bytes())
+        self.assertEqual(
+            self.broker.list_downloadable_files(),
+            [
+                {"path": "assets/picture.bin", "size": attachment.stat().st_size},
+                {"path": "src/main.py", "size": (self.root / "src/main.py").stat().st_size},
+            ],
+        )
+        with self.assertRaises(ValueError):
+            self.broker.read_download("assets/too-large.bin")
+        with self.assertRaises(ValueError):
+            self.broker.read_download(".env")
+        with self.assertRaises(ValueError):
+            self.broker.read_download("../outside.bin")
 
     def test_changes_are_reviewed_before_write_and_approval_applies_atomically(self):
         context = self.broker.read_files(["src/main.py"])
@@ -107,6 +136,8 @@ class RepositoryChangeBrokerTests(unittest.TestCase):
         link.symlink_to(outside)
         with self.assertRaisesRegex(ValueError, "dowiązania"):
             self.broker.read_files(["src/outside.txt"])
+        with self.assertRaises(ValueError):
+            self.broker.read_download("src/outside.txt")
         (self.root / "src/other.py").write_text("other\n", encoding="utf-8")
         with self.assertRaises(RepositoryConflictError):
             self.broker.propose_changes(self.broker.read_files(["src/other.py"]), [{

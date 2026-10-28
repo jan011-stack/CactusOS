@@ -1,6 +1,9 @@
 //! Cooperative fixed-slot scheduler using triangular-wave phase slices.
 
 use crate::hyper_math::hyper_sin;
+use crate::hyper_resource_manager::{
+    allocate_linear, AllocationError, AllocationSummary, ResourceRequest,
+};
 use crate::hyper_shield::{HyperShieldController, RootCapability, SecurityRing};
 
 pub const TASK_SLOTS: usize = 64;
@@ -11,12 +14,23 @@ pub type TaskFn = fn();
 struct ScheduledTask {
     callback: TaskFn,
     ring: SecurityRing,
+    info: TaskInfo,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct TaskInfo {
+    pub pid: u8,
+    pub slot: u8,
+    pub name: &'static str,
+    pub weight: u32,
+    pub coordinate: u32,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum SchedulerError {
     SlotOutOfRange,
     SlotOccupied,
+    EmptyTaskName,
 }
 
 /// Single-owner scheduler. Store it in static memory and call through `&mut`.
@@ -35,7 +49,16 @@ impl HyperScheduler {
     }
 
     pub fn register(&mut self, slot: usize, task: TaskFn) -> Result<(), SchedulerError> {
-        self.register_in_ring(slot, task, SecurityRing::Ring1)
+        self.register_named(slot, "task", task)
+    }
+
+    pub fn register_named(
+        &mut self,
+        slot: usize,
+        name: &'static str,
+        task: TaskFn,
+    ) -> Result<(), SchedulerError> {
+        self.register_named_in_ring(slot, name, task, SecurityRing::Ring1)
     }
 
     pub fn register_in_ring(
@@ -44,16 +67,40 @@ impl HyperScheduler {
         task: TaskFn,
         ring: SecurityRing,
     ) -> Result<(), SchedulerError> {
+        self.register_named_in_ring(slot, "task", task, ring)
+    }
+
+    pub fn register_named_in_ring(
+        &mut self,
+        slot: usize,
+        name: &'static str,
+        task: TaskFn,
+        ring: SecurityRing,
+    ) -> Result<(), SchedulerError> {
         if slot >= TASK_SLOTS {
             return Err(SchedulerError::SlotOutOfRange);
+        }
+        if name.is_empty() {
+            return Err(SchedulerError::EmptyTaskName);
         }
         let bit = 1u64 << slot;
         if self.execution_mask & bit != 0 {
             return Err(SchedulerError::SlotOccupied);
         }
+        let weight = name
+            .as_bytes()
+            .iter()
+            .fold(0u32, |total, byte| total.saturating_add(byte.count_ones()));
         self.tasks[slot] = Some(ScheduledTask {
             callback: task,
             ring,
+            info: TaskInfo {
+                pid: (slot + 1) as u8,
+                slot: slot as u8,
+                name,
+                weight,
+                coordinate: weight,
+            },
         });
         self.execution_mask |= bit;
         Ok(())
@@ -127,6 +174,42 @@ impl HyperScheduler {
     pub const fn execution_mask(&self) -> u64 {
         self.execution_mask
     }
+
+    pub fn task_info(&self, slot: usize) -> Option<TaskInfo> {
+        self.tasks
+            .get(slot)
+            .copied()
+            .flatten()
+            .map(|task| task.info)
+    }
+
+    pub const fn task_count(&self) -> usize {
+        self.execution_mask.count_ones() as usize
+    }
+
+    /// Calculate quotas for registered tasks; inactive slots receive no quota.
+    /// Requests are explicit and indexed by scheduler slot, so task names do
+    /// not implicitly determine resource priority.
+    pub fn resource_quotas(
+        &self,
+        requests: &[ResourceRequest; TASK_SLOTS],
+        budget: u64,
+        cursor: usize,
+        allocations: &mut [u64; TASK_SLOTS],
+    ) -> Result<AllocationSummary, AllocationError> {
+        let inactive = ResourceRequest {
+            minimum: 0,
+            demand: 0,
+            maximum: 0,
+        };
+        let mut active_requests = [inactive; TASK_SLOTS];
+        for (slot, task) in self.tasks.iter().enumerate() {
+            if task.is_some() {
+                active_requests[slot] = requests[slot];
+            }
+        }
+        allocate_linear(&active_requests, budget, cursor, allocations)
+    }
 }
 
 impl Default for HyperScheduler {
@@ -137,13 +220,15 @@ impl Default for HyperScheduler {
 
 #[cfg(test)]
 mod tests {
-    use super::{HyperScheduler, SchedulerError, TASK_SLOTS};
+    use super::{HyperScheduler, SchedulerError, TaskInfo, TASK_SLOTS};
+    use crate::hyper_resource_manager::ResourceRequest;
     use crate::hyper_shield::{HyperShieldController, SecurityRing};
     use crate::terminal::{HyperSpaceTerminal, ROOT_TOKEN_HASH};
     use core::sync::atomic::{AtomicUsize, Ordering};
     use std::panic::{catch_unwind, AssertUnwindSafe};
 
     static RUNS: AtomicUsize = AtomicUsize::new(0);
+    static NAMED_RUNS: AtomicUsize = AtomicUsize::new(0);
     static PROTECTED_RUNS: AtomicUsize = AtomicUsize::new(0);
 
     fn count_run() {
@@ -152,6 +237,10 @@ mod tests {
 
     fn count_protected_run() {
         PROTECTED_RUNS.fetch_add(1, Ordering::Relaxed);
+    }
+
+    fn count_named_run() {
+        NAMED_RUNS.fetch_add(1, Ordering::Relaxed);
     }
 
     #[test]
@@ -177,6 +266,79 @@ mod tests {
         assert_eq!(scheduler.register(TASK_SLOTS, count_run), Err(SchedulerError::SlotOutOfRange));
         scheduler.unregister(63).unwrap();
         assert_eq!(scheduler.execution_mask(), 0);
+    }
+
+    #[test]
+    fn named_tasks_expose_stable_metadata_without_allocations() {
+        NAMED_RUNS.store(0, Ordering::Relaxed);
+        let mut scheduler = HyperScheduler::new();
+        scheduler
+            .register_named(0, "INIT", count_named_run)
+            .unwrap();
+        scheduler
+            .register_named(1, "RUN_HYPER", count_named_run)
+            .unwrap();
+
+        assert_eq!(scheduler.task_count(), 2);
+        assert_eq!(
+            scheduler.task_info(0),
+            Some(TaskInfo {
+                pid: 1,
+                slot: 0,
+                name: "INIT",
+                weight: 13,
+                coordinate: 13,
+            })
+        );
+        assert_eq!(
+            scheduler.task_info(1).map(|task| task.name),
+            Some("RUN_HYPER")
+        );
+        assert_eq!(scheduler.task_info(TASK_SLOTS), None);
+        assert_eq!(
+            scheduler.register_named(2, "", count_run),
+            Err(SchedulerError::EmptyTaskName)
+        );
+        assert_eq!(scheduler.run_slice(6.0), 2);
+        assert_eq!(NAMED_RUNS.load(Ordering::Relaxed), 2);
+    }
+
+    #[test]
+    fn resource_quotas_use_explicit_demands_and_ignore_inactive_slots() {
+        let mut scheduler = HyperScheduler::new();
+        scheduler.register(2, count_run).unwrap();
+        scheduler.register(7, count_run).unwrap();
+
+        let inactive = ResourceRequest {
+            minimum: 0,
+            demand: 0,
+            maximum: 0,
+        };
+        let mut requests = [inactive; TASK_SLOTS];
+        requests[2] = ResourceRequest {
+            minimum: 0,
+            demand: 0,
+            maximum: 10,
+        };
+        requests[7] = ResourceRequest {
+            minimum: 0,
+            demand: 1,
+            maximum: 10,
+        };
+        let mut allocations = [u64::MAX; TASK_SLOTS];
+
+        let summary = scheduler
+            .resource_quotas(&requests, 10, 0, &mut allocations)
+            .unwrap();
+
+        assert_eq!(allocations[2], 3);
+        assert_eq!(allocations[7], 7);
+        assert!(allocations
+            .iter()
+            .enumerate()
+            .all(|(slot, allocation)| slot == 2 || slot == 7 || *allocation == 0));
+        assert_eq!(summary.allocated, 10);
+        assert_eq!(summary.unused, 0);
     }
 
     #[test]

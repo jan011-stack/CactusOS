@@ -1,7 +1,9 @@
+import json
 import unittest
 
 from hyperos import PI, TAU, cos, encode_command, process_command, sin, transform
 from hyperos.terminal_bridge import BinaryVector, VECTOR_BITS
+from vm.svl_kernel import HyperOS
 
 
 class HyperMathTests(unittest.TestCase):
@@ -29,6 +31,27 @@ class TerminalBridgeTests(unittest.TestCase):
             BinaryVector((0, 1))
         with self.assertRaises(ValueError):
             BinaryVector((2,) * VECTOR_BITS)
+
+
+class HyperOSSimulationTests(unittest.TestCase):
+    def test_commands_are_recorded_and_reported_without_execution(self):
+        hyperos = HyperOS()
+        first_pid = hyperos.exec_cmd("INIT")
+        second_pid = hyperos.exec_cmd("RUN_HYPER")
+
+        self.assertNotEqual(first_pid, second_pid)
+        self.assertEqual(hyperos.proc[first_pid]["cmd"], "INIT")
+        self.assertEqual(hyperos.proc[first_pid]["w"], 13)
+        report = json.loads(hyperos.report())
+        self.assertEqual(report["OS"], "8.1.0-Minified")
+        self.assertEqual(report["Metric_C"], 2.06)
+        self.assertEqual(len(report["Tasks"]), 2)
+
+    def test_rejects_empty_nul_and_non_text_commands(self):
+        hyperos = HyperOS()
+        for command in ("", "  ", None, "invalid\x00command"):
+            with self.subTest(command=command), self.assertRaises(ValueError):
+                hyperos.exec_cmd(command)
 
 
 if __name__ == "__main__":

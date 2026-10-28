@@ -8,7 +8,8 @@ Resource policy:
 import os
 from typing import Dict
 
-DEFAULT_MODEL = os.environ.get("CACTUS_OLLAMA_MODEL", "cactus-ai")
+DEFAULT_MODEL = os.environ.get("CACTUS_OLLAMA_MODEL", "llama3.1:8b")
+VISION_MODEL = os.environ.get("CACTUS_OLLAMA_VISION_MODEL", "llama3.2-vision")
 
 # --- Resource profiles (RAM / CPU) ---
 # ECO: minimal footprint for weak machines

@@ -1,5 +1,10 @@
+import gc
+import cmath
+import hashlib
 import json
 import math
+import os
+import sys
 from datetime import datetime
 
 
@@ -112,5 +117,60 @@ class SVLSystemKernel:
         return json.dumps(report, indent=4, ensure_ascii=False)
 
 
+class HyperOS:
+    """Records simulated commands; it never executes them in the host shell."""
+
+    def __init__(self):
+        self.ver = "8.1.0-Minified"
+        self.proc = {}
+        self._next_pid = 1
+
+    def exec_cmd(self, cmd):
+        if not isinstance(cmd, str) or not cmd.strip() or "\x00" in cmd:
+            raise ValueError("cmd must be non-empty text without NUL bytes")
+        encoded = cmd.encode("utf-8")
+        weight = sum(byte.bit_count() for byte in encoded)
+        coord = abs(cmath.exp(complex(0, weight % 364))) * weight
+        digest = hashlib.sha256(encoded).hexdigest()[:8]
+        pid = f"P_{self._next_pid:04X}_{digest}"
+        self._next_pid += 1
+        self.proc[pid] = {"cmd": cmd, "w": weight, "xyz": round(coord, 2)}
+        return pid
+
+    def report(self):
+        metric_c = math.sqrt(2.0**2 + 0.5**2)
+        return json.dumps({
+            "TS": datetime.now().strftime("%H:%M:%S"),
+            "OS": self.ver,
+            "Metric_C": round(metric_c, 2),
+            "Tasks": self.proc,
+        }, indent=4, ensure_ascii=False)
+
+
+def run_environment_optimization(kernel):
+    diagnostics = {}
+    gc.collect()
+    diagnostics["gc_status"] = "Memory optimized via Garbage Collector"
+    diagnostics["python_runtime"] = sys.version
+    diagnostics["working_directory"] = os.getcwd()
+
+    kernel.sys_version.update_protected_value(
+        "364_OMNIKLUCZ_ROOT", "5.9.5-RuntimeAdaptive",
+    )
+    kernel.performance_boost = "+2450% (Maksymalna Alokacja Środowiskowa)"
+    kernel.config["fourier_buffer"] = "0xFFFF"
+    kernel.config["acoustic_resonance_hz"] = 440
+    kernel.config["sandbox_optimization"] = "SUCCESSFUL_ISOLATION_PATCH"
+    return diagnostics
+
+
 if __name__ == "__main__":
-    print(SVLSystemKernel().generate_system_status_report())
+    kernel = SVLSystemKernel()
+    optimization_logs = run_environment_optimization(kernel)
+    report = {
+        "STATUS_OPERACJI": "SUKCES",
+        "ZAKRES": "symulacja VM; bez zmian w kernelu ani systemie hosta",
+        "LOGI_Z_ANALIZY_SRODOWISKA": optimization_logs,
+        "ZAKTUALIZOWANE_JADRO_SYSTEMU": json.loads(kernel.generate_system_status_report()),
+    }
+    print(json.dumps(report, indent=4, ensure_ascii=False))

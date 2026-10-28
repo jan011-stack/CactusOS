@@ -8,7 +8,7 @@ CactusOS is an experimental project combining:
 ## Current Provider Order
 
 1. **Gemini** (primary) — requires `GEMINI_API_KEY`
-2. **Ollama** (fallback) — local, recommended model `llama3.2:3b` for 16 GB RAM
+2. **Ollama** (fallback) — local, default text model `llama3.1:8b`; use the eco profile on 16 GB hosts
 
 The system uses a single **Cactus AI** role.
 

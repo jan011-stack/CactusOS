@@ -1,8 +1,6 @@
-# Cactus AI — optimized for 16GB RAM (Codespaces / local)
-# Base: llama3.2:3b (good quality, ~2GB VRAM/RAM, fast on CPU)
-# Avoid llama3.2-vision — too heavy for this environment.
+# Cactus AI — Llama 3.1 8B text model for local inference.
 
-FROM llama3.2:3b
+FROM llama3.1:8b
 
 PARAMETER num_ctx 2048
 PARAMETER num_batch 4

@@ -1,6 +1,5 @@
 #!/usr/bin/env bash
-# Best Ollama setup for 16GB RAM (GitHub Codespaces / local)
-# Model: llama3.2:3b — good quality, ~2GB RAM, fast enough on CPU
+# Ollama setup for Llama 3.1 8B text on a 16GB host.
 set -euo pipefail
 
 export OLLAMA_HOST="${OLLAMA_HOST:-127.0.0.1:11434}"
@@ -8,8 +7,8 @@ export OLLAMA_NUM_PARALLEL=1
 export OLLAMA_MAX_LOADED_MODELS=1
 export OLLAMA_KEEP_ALIVE="5m"
 export OLLAMA_FLASH_ATTENTION=1
-export CACTUS_OLLAMA_PROFILE=balanced
-export CACTUS_OLLAMA_MODEL=llama3.2:3b
+export CACTUS_OLLAMA_PROFILE="${CACTUS_OLLAMA_PROFILE:-eco}"
+export CACTUS_OLLAMA_MODEL="${CACTUS_OLLAMA_MODEL:-llama3.1:8b}"
 
 echo "=== CactusOS Ollama 16GB setup ==="
 echo "Host: $OLLAMA_HOST"
@@ -35,13 +34,10 @@ if ! curl -sf --max-time 2 "http://${OLLAMA_HOST}/api/tags" >/dev/null 2>&1; the
   echo
 fi
 
-echo "Pulling recommended model (llama3.2:3b)..."
-ollama pull llama3.2:3b
-
-echo "Creating cactus-ai from Modelfile..."
-ollama create cactus-ai -f Modelfile || true
+echo "Pulling configured model ($CACTUS_OLLAMA_MODEL)..."
+ollama pull "$CACTUS_OLLAMA_MODEL"
 
 echo "=== Status ==="
 ollama list
-echo "Profile: balanced | MAX_LOADED=1 | KEEP_ALIVE=5m | FLASH_ATTENTION=1"
-echo "Done. Set CACTUS_OLLAMA_MODEL=llama3.2:3b or cactus-ai"
+echo "Profile: $CACTUS_OLLAMA_PROFILE | MAX_LOADED=1 | KEEP_ALIVE=5m | FLASH_ATTENTION=1"
+echo "Done. Configure the web server with CACTUS_OLLAMA_MODEL=$CACTUS_OLLAMA_MODEL"

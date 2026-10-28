@@ -8,6 +8,7 @@ export OLLAMA_MAX_LOADED_MODELS="${OLLAMA_MAX_LOADED_MODELS:-1}"
 export OLLAMA_KEEP_ALIVE="${OLLAMA_KEEP_ALIVE:-0}"
 export OLLAMA_FLASH_ATTENTION="${OLLAMA_FLASH_ATTENTION:-1}"
 export CACTUS_OLLAMA_PROFILE="${CACTUS_OLLAMA_PROFILE:-eco}"
+export CACTUS_OLLAMA_MODEL="${CACTUS_OLLAMA_MODEL:-llama3.1:8b}"
 
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 cd "$ROOT"
@@ -36,11 +37,12 @@ case "$MODE" in
   balanced)
     ollama create cactus-ai -f Modelfile.balanced
     export CACTUS_OLLAMA_PROFILE=balanced
+    export CACTUS_OLLAMA_MODEL=cactus-ai
     echo "Model: cactus-ai balanced"
     ;;
   *)
-    ollama create cactus-ai -f Modelfile
-    echo "Model: cactus-ai eco (default)"
+    ollama pull "$CACTUS_OLLAMA_MODEL"
+    echo "Model: $CACTUS_OLLAMA_MODEL eco (default)"
     ;;
 esac
 

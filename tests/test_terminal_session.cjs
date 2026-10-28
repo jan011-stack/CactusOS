@@ -13,6 +13,22 @@ function client(fetch) {
   return { ...module.exports, meta };
 }
 
+test('terminal approval commands recognize approve and reject aliases', () => {
+  const context = {};
+  const source = fs.readFileSync(path.join(__dirname, '../web/root_terminal.js'), 'utf8');
+  vm.runInNewContext(`${source}\nglobalThis.approvalCommand = terminalApprovalCommand;`, context);
+
+  for (const command of ['approve', ' ACCEPT ', 'Yes']) {
+    assert.equal(context.approvalCommand(command), true);
+  }
+  for (const command of ['reject', ' DENY ', 'No']) {
+    assert.equal(context.approvalCommand(command), false);
+  }
+  for (const command of ['approved', 'yeah', 'status']) {
+    assert.equal(context.approvalCommand(command), null);
+  }
+});
+
 test('expired CSRF refreshes once and resends the same payload', async () => {
   const calls = [];
   const api = client(async (url, options) => {

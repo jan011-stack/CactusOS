@@ -3,6 +3,7 @@
 import argparse
 import base64
 import binascii
+from datetime import datetime, timezone
 import json
 import ipaddress
 import os
@@ -13,15 +14,16 @@ import shlex
 import selectors
 import shutil
 import subprocess
+import sys
 import threading
 import time
 from http.server import SimpleHTTPRequestHandler, ThreadingHTTPServer
 from urllib.request import Request, urlopen
 from urllib.error import HTTPError, URLError
-from urllib.parse import urlsplit
+from urllib.parse import parse_qs, quote, urlsplit
 
 from hyperos.terminal_bridge import process_command
-from hyperos.model_profiles import CACTUS_SYSTEM_CONTEXT, DEFAULT_MODEL, MODEL_OPTIONS, active_profile
+from hyperos.python_scripts import PythonScriptBroker
 from hyperos.repository_changes import RepositoryChangeBroker, RepositoryConflictError
 
 WORKSPACE = Path(__file__).resolve().parents[1]
@@ -30,12 +32,154 @@ GEMINI_API_URL = f"https://generativelanguage.googleapis.com/v1beta/models/{GEMI
 CACTUS_SI_MODEL = "cactus-si-v6.0"
 CACTUS_SI_MAX_RESPONSE_BYTES = 65536
 MAX_CHAT_REQUEST_BYTES = 5 * 1024 * 1024
+COMMAND_PROPOSAL_TTL_SECONDS = 600
 MAX_CHAT_IMAGES = 4
 MAX_CHAT_IMAGE_BYTES = 1 * 1024 * 1024
 MAX_CHAT_IMAGES_BYTES = 3 * 1024 * 1024
+MAX_PYTHON_SCRIPT_REQUEST_BYTES = 512 * 1024
+DOWNLOAD_AUDIT_PATH = Path(os.environ.get(
+    "XDG_STATE_HOME", Path.home() / ".local" / "state",
+)) / "cactusos" / "downloads.jsonl"
+_DOWNLOAD_AUDIT_LOCK = threading.Lock()
 _CHAT_IMAGE_PREFIX = re.compile(
     r"^data:(image/jpeg|image/png|image/webp);base64,([A-Za-z0-9+/]+={0,2})$"
 )
+_SYSTEM_METRICS_LOCK = threading.Lock()
+_SYSTEM_CPU_SAMPLE = None
+
+
+def _read_meminfo():
+    values = {}
+    for line in Path("/proc/meminfo").read_text(encoding="ascii").splitlines():
+        key, separator, value = line.partition(":")
+        if not separator:
+            continue
+        fields = value.split()
+        if fields and fields[0].isdigit():
+            values[key] = int(fields[0]) * (1024 if len(fields) > 1 and fields[1] == "kB" else 1)
+    total = values.get("MemTotal", 0)
+    available = values.get("MemAvailable", values.get("MemFree", 0))
+    if total <= 0:
+        raise OSError("/proc/meminfo has no memory total")
+    return total, min(available, total), "host"
+
+
+def _record_download_audit(path, status, outcome, byte_count=0, error=None, audit_path=None):
+    audit_path = Path(audit_path) if audit_path else DOWNLOAD_AUDIT_PATH
+    entry = {
+        "time": datetime.now(timezone.utc).isoformat(),
+        "path": path,
+        "status": status,
+        "outcome": outcome,
+        "bytes": byte_count,
+    }
+    if error:
+        entry["error"] = error
+    line = json.dumps(entry, ensure_ascii=False) + "\n"
+    with _DOWNLOAD_AUDIT_LOCK:
+        audit_path.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
+        descriptor = os.open(audit_path, os.O_WRONLY | os.O_APPEND | os.O_CREAT, 0o600)
+        with os.fdopen(descriptor, "a", encoding="utf-8") as stream:
+            stream.write(line)
+            stream.flush()
+            os.fsync(stream.fileno())
+
+
+def _read_download_audit(audit_path=None):
+    audit_path = Path(audit_path) if audit_path else DOWNLOAD_AUDIT_PATH
+    if not audit_path.exists():
+        return []
+    with _DOWNLOAD_AUDIT_LOCK, audit_path.open(encoding="utf-8") as stream:
+        lines = stream.readlines()[-100:]
+    return [json.loads(line) for line in lines if line.strip()]
+
+
+def _read_memory_metrics():
+    try:
+        current = int(Path("/sys/fs/cgroup/memory.current").read_text().strip())
+        limit_text = Path("/sys/fs/cgroup/memory.max").read_text().strip()
+        limit = int(limit_text) if limit_text != "max" else 0
+        if 0 < limit < (1 << 60):
+            return limit, min(current, limit), "kontener"
+    except (OSError, ValueError):
+        pass
+    try:
+        current = int(Path("/sys/fs/cgroup/memory/memory.usage_in_bytes").read_text().strip())
+        limit = int(Path("/sys/fs/cgroup/memory/memory.limit_in_bytes").read_text().strip())
+        if 0 < limit < (1 << 60):
+            return limit, min(current, limit), "kontener"
+    except (OSError, ValueError):
+        pass
+    return _read_meminfo()
+
+
+def _read_cpu_sample():
+    try:
+        stats = {}
+        for line in Path("/sys/fs/cgroup/cpu.stat").read_text().splitlines():
+            key, value = line.split()
+            stats[key] = int(value)
+        usage = stats["usage_usec"]
+        quota_text, period_text = Path("/sys/fs/cgroup/cpu.max").read_text().split()
+        capacity = (
+            float(quota_text) / float(period_text)
+            if quota_text != "max" else float(os.cpu_count() or 1)
+        )
+        if capacity > 0:
+            return "kontener", usage, 0, capacity
+    except (OSError, ValueError, KeyError, ZeroDivisionError):
+        pass
+
+    try:
+        fields = Path("/proc/stat").read_text(encoding="ascii").splitlines()[0].split()
+        if fields[0] == "cpu":
+            counters = [int(value) for value in fields[1:]]
+            total = sum(counters)
+            idle = counters[3] + (counters[4] if len(counters) > 4 else 0)
+            return "host", total, idle, 0
+    except (OSError, ValueError, IndexError):
+        pass
+    return None
+
+
+def _read_cpu_percent():
+    global _SYSTEM_CPU_SAMPLE
+    sample = _read_cpu_sample()
+    if sample is None:
+        return None, "niedostępny"
+    scope, counter, idle, capacity = sample
+    now = time.monotonic()
+    with _SYSTEM_METRICS_LOCK:
+        previous = _SYSTEM_CPU_SAMPLE
+        _SYSTEM_CPU_SAMPLE = (scope, counter, idle, capacity, now)
+    if previous is None or previous[0] != scope or now <= previous[4]:
+        return None, scope
+    elapsed = now - previous[4]
+    counter_delta = counter - previous[1]
+    if elapsed <= 0 or counter_delta < 0:
+        return None, scope
+    if scope == "host":
+        idle_delta = idle - previous[2]
+        return (max(0.0, min(100.0, (counter_delta - idle_delta) * 100.0 / counter_delta))
+                if counter_delta else None), scope
+    if capacity <= 0:
+        return None, scope
+    percent = counter_delta / 1_000_000 / elapsed / previous[3] * 100.0
+    return max(0.0, min(100.0, percent)), scope
+
+
+def system_metrics():
+    total, used, memory_scope = _read_memory_metrics()
+    cpu_percent, cpu_scope = _read_cpu_percent()
+    return {
+        "memory_total_bytes": total,
+        "memory_used_bytes": used,
+        "memory_available_bytes": max(0, total - used),
+        "memory_percent": round(used * 100.0 / total, 1) if total else 0.0,
+        "memory_scope": memory_scope,
+        "cpu_percent": round(cpu_percent, 1) if cpu_percent is not None else None,
+        "cpu_scope": cpu_scope,
+    }
 
 
 def validate_chat_messages(messages):
@@ -114,6 +258,7 @@ def load_dotenv(path=WORKSPACE / ".env"):
         key, separator, value = line.partition("=")
         if separator and key.strip() in {
             "GEMINI_API_KEY", "CACTUS_SI_API_URL", "CACTUS_SI_API_KEY",
+            "CACTUS_OLLAMA_MODEL", "CACTUS_OLLAMA_PROFILE",
         }:
             value = value.strip()
             if len(value) >= 2 and value[0] == value[-1] and value[0] in {"'", '"'}:
@@ -123,6 +268,14 @@ def load_dotenv(path=WORKSPACE / ".env"):
 
 
 load_dotenv()
+
+from hyperos.model_profiles import (
+    CACTUS_SYSTEM_CONTEXT,
+    DEFAULT_MODEL,
+    MODEL_OPTIONS,
+    VISION_MODEL,
+    active_profile,
+)
 
 
 def gemini_api_key():
@@ -402,11 +555,9 @@ def root_available():
     return result.returncode == 0 and result.stdout.strip() == b"0"
 
 
-def execute_command(command, elevated=False):
-    prefix = ["sudo", "-n", "--"] if elevated and os.geteuid() != 0 else []
+def _collect_process_output(arguments):
     process = subprocess.Popen(
-        [*prefix, "/usr/bin/timeout", "-k", "5s", "60s",
-         "/bin/bash", "-c", command],
+        arguments,
         cwd=WORKSPACE, stdin=subprocess.DEVNULL,
         stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
     )
@@ -425,6 +576,30 @@ def execute_command(command, elevated=False):
     process.stdout.close()
     return {"exit_code": process.wait(), "output": output.decode("utf-8", "replace"),
             "truncated": total > 65536}
+
+
+def execute_command(command, elevated=False):
+    prefix = ["sudo", "-n", "--"] if elevated and os.geteuid() != 0 else []
+    return _collect_process_output([
+        *prefix, "/usr/bin/timeout", "-k", "5s", "60s", "/bin/bash", "-c", command,
+    ])
+
+
+def execute_python_source(source, script_path=None):
+    prefix = ["sudo", "-n", "--"] if os.geteuid() != 0 else []
+    source_path = script_path or "<pasted-python>"
+    bootstrap = (
+        "import os, sys; "
+        "_source_path, _source = sys.argv[1:3]; "
+        "sys.argv = [_source_path]; "
+        "sys.path[0] = os.path.dirname(os.path.abspath(_source_path)); "
+        "_namespace = {'__name__': '__main__', '__file__': _source_path}; "
+        "exec(compile(_source, _source_path, 'exec'), _namespace)"
+    )
+    return _collect_process_output([
+        *prefix, "/usr/bin/timeout", "-k", "5s", "60s",
+        sys.executable, "-c", bootstrap, source_path, source,
+    ])
 
 
 def execute_root(command):
@@ -482,9 +657,9 @@ class TerminalBroker:
                 if len(self.pending) >= 8:
                     raise ValueError("Za duzo oczekujacych propozycji")
                 proposal_id = secrets.token_urlsafe(24)
-                self.pending[proposal_id] = (command, now + 180, elevated)
+                self.pending[proposal_id] = (command, now + COMMAND_PROPOSAL_TTL_SECONDS, elevated)
         return {"reply": result["reply"][:8000], "command": command,
-                "proposal_id": proposal_id, "expires_in": 180,
+                "proposal_id": proposal_id, "expires_in": COMMAND_PROPOSAL_TTL_SECONDS,
                 "vector": "".join(map(str, process_command(prompt).bits))}
 
     def resolve(self, proposal_id, approved, displayed_command, elevated=None):
@@ -512,8 +687,14 @@ class TerminalBroker:
             self.execution_lock.release()
 
 
-def make_handler(broker, csrf, port, chat_origin=None, repo_broker=None):
+def make_handler(
+    broker, csrf, port, chat_origin=None, repo_broker=None, script_broker=None,
+    download_audit_path=None,
+):
     repo_broker = repo_broker or RepositoryChangeBroker(WORKSPACE)
+    script_broker = script_broker or PythonScriptBroker(
+        repo_broker, execute_python_source, execution_lock=broker.execution_lock,
+    )
     local_hosts = {f"localhost:{port}", f"127.0.0.1:{port}"}
     local_origins = {f"{scheme}://{host}" for host in local_hosts for scheme in ("http", "https")}
     chat_hosts = local_hosts | ({urlsplit(chat_origin).netloc} if chat_origin else set())
@@ -545,6 +726,11 @@ def make_handler(broker, csrf, port, chat_origin=None, repo_broker=None):
                 return self.json_response(403, {"error": "Niedozwolony Host"})
             if self.path == "/api/session":
                 return self.json_response(200, {"csrf": csrf})
+            if self.path == "/api/system/metrics":
+                try:
+                    return self.json_response(200, system_metrics())
+                except (OSError, ValueError):
+                    return self.json_response(503, {"error": "Nie można odczytać metryk systemu"})
             if self.path == "/api/ollama/version":
                 try:
                     with urlopen("http://127.0.0.1:11434/api/version", timeout=3) as response:
@@ -573,8 +759,78 @@ def make_handler(broker, csrf, port, chat_origin=None, repo_broker=None):
                 })
             if self.path == "/api/repo/files":
                 return self.json_response(200, {"files": repo_broker.list_files()})
+            if self.path == "/api/explorer/files":
+                return self.json_response(200, {"files": repo_broker.list_downloadable_files()})
+            if self.path == "/api/explorer/downloads":
+                try:
+                    return self.json_response(200, {
+                        "downloads": _read_download_audit(download_audit_path),
+                        "note": "response_written oznacza zapis odpowiedzi do gniazda serwera, nie potwierdza zapisu pliku przez przeglądarkę.",
+                    })
+                except (OSError, ValueError):
+                    return self.json_response(503, {"error": "Nie można odczytać dziennika pobrań"})
+            request_url = urlsplit(self.path)
+            if request_url.path == "/api/explorer/download":
+                paths = parse_qs(request_url.query, keep_blank_values=True).get("path", [])
+                if len(paths) != 1:
+                    try:
+                        _record_download_audit(
+                            None, 400, "rejected", error="Wskaż jeden plik do pobrania",
+                            audit_path=download_audit_path,
+                        )
+                    except OSError as error:
+                        self.log_message("Download audit failed: %s", type(error).__name__)
+                        return self.json_response(503, {"error": "Nie można zapisać dziennika pobrań"})
+                    return self.json_response(400, {"error": "Wskaż jeden plik do pobrania"})
+                try:
+                    content = repo_broker.read_download(paths[0])
+                except ValueError as error:
+                    try:
+                        _record_download_audit(
+                            paths[0], 400, "rejected", error=str(error),
+                            audit_path=download_audit_path,
+                        )
+                    except OSError as audit_error:
+                        self.log_message("Download audit failed: %s", type(audit_error).__name__)
+                        return self.json_response(503, {"error": "Nie można zapisać dziennika pobrań"})
+                    return self.json_response(400, {"error": str(error)})
+                try:
+                    _record_download_audit(
+                        paths[0], 200, "response_prepared", len(content),
+                        audit_path=download_audit_path,
+                    )
+                except OSError as error:
+                    self.log_message("Download audit failed: %s", type(error).__name__)
+                    return self.json_response(503, {"error": "Nie można zapisać dziennika pobrań"})
+                filename = quote(Path(paths[0]).name)
+                self.send_response(200)
+                self.send_header("Content-Type", "application/octet-stream")
+                self.send_header("Content-Disposition", f"attachment; filename*=UTF-8''{filename}")
+                self.send_header("Content-Length", str(len(content)))
+                self.end_headers()
+                try:
+                    self.wfile.write(content)
+                except (BrokenPipeError, ConnectionResetError):
+                    try:
+                        _record_download_audit(
+                            paths[0], 499, "client_disconnected", len(content),
+                            audit_path=download_audit_path,
+                        )
+                    except OSError as error:
+                        self.log_message("Download audit failed: %s", type(error).__name__)
+                    return
+                try:
+                    _record_download_audit(
+                        paths[0], 200, "response_written", len(content),
+                        audit_path=download_audit_path,
+                    )
+                except OSError as error:
+                    self.log_message("Download audit failed after response: %s", type(error).__name__)
+                return
             if self.path == "/api/repo/pending":
                 return self.json_response(200, {"proposals": repo_broker.list_pending()})
+            if self.path == "/api/root/scripts":
+                return self.json_response(200, {"scripts": script_broker.list_scripts()})
             if self.path == "/api/root/status":
                 try:
                     available = root_available()
@@ -616,7 +872,11 @@ def make_handler(broker, csrf, port, chat_origin=None, repo_broker=None):
                 })
             try:
                 length = int(self.headers.get("Content-Length", "0"))
-                body_limit = MAX_CHAT_REQUEST_BYTES if self.path == "/api/ollama/chat" else 16384
+                body_limit = (
+                    MAX_CHAT_REQUEST_BYTES if self.path == "/api/ollama/chat"
+                    else MAX_PYTHON_SCRIPT_REQUEST_BYTES
+                    if self.path == "/api/root/script/propose" else 16384
+                )
                 if not 0 < length <= body_limit:
                     raise ValueError("Nieprawidlowy rozmiar zadania")
                 data = json.loads(self.rfile.read(length))
@@ -634,6 +894,20 @@ def make_handler(broker, csrf, port, chat_origin=None, repo_broker=None):
                     result = repo_broker.propose_changes(original_files, changes)
                 elif self.path == "/api/repo/resolve":
                     result = repo_broker.resolve(data.get("proposal_id"), data.get("approved"))
+                elif self.path == "/api/root/script/propose":
+                    if not root_available():
+                        raise ValueError("Wykonawca administratora jest niedostępny")
+                    if "source" in data:
+                        if "path" in data:
+                            raise ValueError("Wybierz plik albo wklej skrypt, nie oba naraz")
+                        result = script_broker.propose_source(data["source"])
+                    else:
+                        result = script_broker.propose(data.get("path"))
+                elif self.path == "/api/root/script/resolve":
+                    if data.get("approved") is True and not root_available():
+                        raise ValueError("Wykonawca administratora jest niedostępny")
+                    result = script_broker.resolve(data.get("proposal_id"), data.get("approved"),
+                                                   data.get("sha256"))
                 elif self.path == "/api/root/propose":
                     result = broker.propose(data.get("prompt"), elevated=True)
                 elif self.path == "/api/root/resolve":
@@ -663,7 +937,7 @@ def make_handler(broker, csrf, port, chat_origin=None, repo_broker=None):
             messages = validate_chat_messages(data.get("messages"))
             data = {**data, "messages": messages}
             if any(message["images"] for message in messages):
-                return self.proxy_ollama_chat(data, "Ollama · Llama Vision")
+                return self.proxy_ollama_chat(data, "Ollama · Llama Vision", model=VISION_MODEL)
             provider = None
             if cactus_si_config() is not None:
                 try:
@@ -726,12 +1000,12 @@ def make_handler(broker, csrf, port, chat_origin=None, repo_broker=None):
             self.wfile.write(body)
             self.close_connection = True
 
-        def proxy_ollama_chat(self, data, provider):
+        def proxy_ollama_chat(self, data, provider, model=DEFAULT_MODEL):
             messages = data["messages"]
             request = Request(
                 "http://127.0.0.1:11434/api/chat",
                 data=json.dumps({
-                    "model": DEFAULT_MODEL, "messages": [
+                    "model": model, "messages": [
                         {
                             "role": message["role"],
                             "content": message["content"],

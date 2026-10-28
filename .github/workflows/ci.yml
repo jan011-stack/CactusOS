@@ -22,5 +22,17 @@ jobs:
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
+      - name: Cargo test (no_std lib)
+        run: cargo test --lib
       - name: Cargo check (no_std lib)
-        run: cargo check --lib || true
+        run: cargo check --lib
+      - name: Install bare-metal target
+        run: rustup target add x86_64-unknown-none
+      - name: Cargo check (bare-metal kernel)
+        run: cargo check --release --target x86_64-unknown-none --features baremetal --bin hyperos-kernel
+      - name: Install QEMU smoke-test tools
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends qemu-system-x86 grub-common grub-pc-bin xorriso mtools
+      - name: Boot kernel in QEMU
+        run: bash vm/cactus-kernel-qemu.sh
